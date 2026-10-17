@@ -2,30 +2,40 @@
 
 `meetrec` records your microphone **and** whatever the PC is playing. That captures the other people in Zoom, Google Meet, Teams, Webex, Slack huddles, a phone-link call, or any other app; it doesn't care which meeting app you use. It can also take screenshots of shared slides. When you stop, it sends everything to your Meeting Notes server, which produces the transcript, speaker labels and minutes as usual. Screenshots are given to Gemini in the same single request (still one request per meeting, so the free tier is enough), and the most relevant ones appear inside the minutes.
 
-It's a single 7 MB console program with no installer. While recording it uses next to no CPU and about 20 MB of RAM.
+It's a single 8 MB program. Double-click it for a small floating recorder button; there's also a terminal mode. While recording it uses next to no CPU and about 20 MB of RAM.
 
-```
-meetrec record --title "Weekly sync" --lang hi
-● 00:12:31  REC  mic ▮▮▮▯▯▯  pc ▮▮▮▮▯▯  shots 4
-Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screenshots
-```
+## Install
 
-## Download
-
-Get `meetrec.exe` from the [latest release](https://github.com/Sarin-jacob/meetrec/releases/latest) (Windows 10/11, 64-bit). It isn't code-signed, so the first time Windows SmartScreen may say "Windows protected your PC": click **More info → Run anyway**. Put it in a folder of its own, e.g. `C:\Tools\meetrec\`, and run it from a terminal (PowerShell or Windows Terminal) opened in that folder.
-
-## Setup (once per PC)
-
-1. In the web app, open **Settings → Desktop recorder → Create token**. Copy the command it shows and run it:
+1. Download `meetrec.exe` from the [latest release](https://github.com/Sarin-jacob/meetrec/releases/latest) (Windows 10/11, 64-bit). It isn't code-signed, so Windows SmartScreen may say "Windows protected your PC": click **More info → Run anyway**.
+2. **Double-click it once.** It installs itself in `%LOCALAPPDATA%\Programs\meetrec`, adds that folder to your PATH and adds **meetrec** to the Start menu (no admin rights needed). You can delete the downloaded file afterwards. Running a newer download later updates the installed copy the same way.
+3. **Sign in, once:** in the web app open **Settings → Desktop recorder → Create token**, then paste the command it shows into a new terminal (PowerShell or Windows Terminal):
    ```
    meetrec login --server https://meetings.example.com --token mn_...
    ```
-2. If the server is behind **Cloudflare Access**, the admin adds a **Bypass** policy for the path `/api/device/` (the token protects those endpoints). Alternatively, use a Cloudflare service token: `meetrec login ... --cf-id ID --cf-secret SECRET`.
+4. If the server is behind **Cloudflare Access**, the admin adds a **Bypass** policy for the path `/api/device/` (the token protects those endpoints). Alternatively, use a Cloudflare service token: `meetrec login ... --cf-id ID --cf-secret SECRET`.
 
-## Recording
+`meetrec uninstall` removes it from PATH, the Start menu and its folder (recordings and the sign-in are kept).
+
+## The floating recorder
+
+Start **meetrec** from the Start menu (or double-click `meetrec.exe`). A small pill appears in the bottom-right corner; drag it anywhere. It shows the recording time and two level bars (your mic, the PC's sound), so you can see it's hearing the meeting.
+
+**Click it** for the menu: Start / Stop, Pause, Screenshot now, the spoken **language** and the number of **people** (remembered for next time), slide screenshots on/off, the recordings folder, **Hide to taskbar** and Quit.
+
+**Shortcuts** (while the pill is showing): **Ctrl+Alt+R** start / stop, **Ctrl+Alt+P** pause, **Ctrl+Alt+S** screenshot now, **Ctrl+Alt+X** pause screenshots.
+
+**Hide to taskbar** swaps the pill for a taskbar button that shows the time; recording carries on, and the shortcuts are off so they can't be pressed by accident. Click the taskbar button to bring the pill back.
+
+**When you stop**, a small window asks for the meeting title (taken from Teams/Webex window titles when it can), the language and the number of people. **Upload** sends it; **Discard** keeps the recording in its folder without sending it. If you don't touch it, it uploads with those defaults after a minute. The pill then shows the upload progress and "Sent ✓".
+
+The pill hides itself from screen shares and recordings, so it never shows up in a presentation or in the screenshots.
+
+## Recording in a terminal
 
 ```
 meetrec record --title "Client call" --lang ml --people 4
+● 00:12:31  REC  mic ▮▮▮▯▯▯  pc ▮▮▮▮▯▯  shots 4
+Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screenshots
 ```
 
 | Option | |
@@ -41,7 +51,7 @@ meetrec record --title "Client call" --lang ml --people 4
 | `--max 2h` | stop automatically |
 | `--no-upload` | keep it local; send later with `meetrec upload FOLDER` |
 
-**Where recordings go:** `~/MeetRec/<date time title>/` holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped.
+**Where recordings go:** `~/MeetRec/<date time title>/` (or the folder in the `MEETREC_DIR` environment variable) holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped.
 
 **You are labelled automatically.** Because your mic is on its own channel, the server knows which speech is yours and names that speaker with the name set in the web app (Settings → Your name). It also keeps learning your voice from these recordings, which helps phone recordings too.
 
@@ -101,6 +111,8 @@ go build -ldflags "-s -w" -o meetrec.exe .
 go test ./...
 ```
 
+The icon, the manifest (modern Windows controls, DPI awareness) and the version details live in `winres/` and are compiled into `rsrc_windows_amd64.syso`, which `go build` picks up. After changing them: `go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64`. Local builds report version `dev` and don't install themselves (set `MEETREC_INSTALL=1` to test that).
+
 **Releases:** pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`, which tests, builds `meetrec.exe` (with that version inside) and publishes it as a GitHub release. The web app's Settings page links to the latest one. A server that can't reach GitHub can serve its own copy instead: put `meetrec.exe` in `DATA_DIR/downloads/`.
 
 ## Files
@@ -113,4 +125,8 @@ go test ./...
 | `vision.go` | finding the shared content: layout, faces (pigo), motion, photo-like areas |
 | `window_windows.go` | capturing the meeting window |
 | `upload.go` | resumable upload of audio and screenshots |
-| `main.go` | commands, keys, status line |
+| `main.go` | commands, terminal keys, status line |
+| `session.go` | one recording: capture threads, mixer, WAV file, screenshots |
+| `gui_windows.go` | the floating recorder, taskbar button, shortcuts, the window after stopping |
+| `install_windows.go` | install on first run, PATH, Start menu entry, uninstall |
+| `winres/` | icon and Windows manifest |

@@ -9,7 +9,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,9 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/term"
@@ -31,10 +28,20 @@ var version = "dev"
 // ---------------------------------------------------------------- config
 
 type config struct {
-	Server         string `json:"server"`
-	Token          string `json:"token"`
-	CFClientID     string `json:"cf_client_id,omitempty"`
-	CFClientSecret string `json:"cf_client_secret,omitempty"`
+	Server         string   `json:"server"`
+	Token          string   `json:"token"`
+	CFClientID     string   `json:"cf_client_id,omitempty"`
+	CFClientSecret string   `json:"cf_client_secret,omitempty"`
+	GUI            guiPrefs `json:"gui"`
+}
+
+// What the floating window remembers between meetings.
+type guiPrefs struct {
+	Language string `json:"language,omitempty"` // last spoken language chosen
+	People   int    `json:"people,omitempty"`   // 0 = not sure
+	NoShots  bool   `json:"no_shots,omitempty"`
+	X        int32  `json:"x,omitempty"` // overlay position (0,0 = default corner)
+	Y        int32  `json:"y,omitempty"`
 }
 
 func configPath() string {
@@ -48,13 +55,21 @@ func configPath() string {
 	return filepath.Join(dir, "meetrec", "config.json")
 }
 
+var errNotSetUp = errors.New("not set up yet: run `meetrec login --server URL --token TOKEN` (get the token in the web app: Settings → Desktop recorder)")
+
 func loadConfig() (config, error) {
 	var c config
 	b, err := os.ReadFile(configPath())
 	if err != nil {
-		return c, errors.New("not set up yet: run `meetrec login --server URL --token TOKEN` (get the token in the web app: Settings → Desktop recorder)")
+		return c, errNotSetUp
 	}
-	return c, json.Unmarshal(b, &c)
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, err
+	}
+	if c.Server == "" || c.Token == "" {
+		return c, errNotSetUp
+	}
+	return c, nil
 }
 
 func saveConfig(c config) error {
@@ -68,12 +83,30 @@ func saveConfig(c config) error {
 // ---------------------------------------------------------------- main
 
 func main() {
+	cleanupOldExe()
 	if len(os.Args) < 2 {
+		if ownConsole() { // double-clicked: Explorer gave us a console of our own
+			startGUI()
+			return
+		}
 		usage()
 		os.Exit(2)
 	}
+	if os.Args[1] != "gui" && os.Args[1] != "uninstall" {
+		if msg, err := install(); err != nil {
+			fmt.Fprintln(os.Stderr, "note: couldn't install meetrec:", err)
+		} else if msg != "" {
+			fmt.Println(msg)
+		}
+	}
 	var err error
 	switch os.Args[1] {
+	case "gui":
+		startGUI()
+	case "install":
+		// done above
+	case "uninstall":
+		err = uninstall()
 	case "login":
 		err = cmdLogin(os.Args[2:])
 	case "record":
@@ -107,10 +140,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `meetrec: record online meetings (mic + PC audio + screenshots) for Meeting Notes
 
   meetrec login --server URL --token TOKEN     one-time setup (token: web app → Settings → Desktop recorder)
-  meetrec record [options]                     record now; press q to stop, then it uploads
+  meetrec gui                                  the floating recorder (same as double-clicking
+                                               meetrec.exe, or Start menu → meetrec)
+  meetrec record [options]                     record in this terminal; press q to stop, then it uploads
   meetrec upload FOLDER                        upload (or finish uploading) a recording
   meetrec displays                             list screens for --display
   meetrec windows                              list windows for --window
+  meetrec uninstall                            remove meetrec from PATH and the Start menu
 
 record options:
   --title TEXT        meeting title
@@ -144,7 +180,8 @@ func cmdLogin(args []string) error {
 	if *server == "" || *token == "" {
 		return errors.New("both --server and --token are needed")
 	}
-	cfg := config{Server: strings.TrimRight(*server, "/"), Token: strings.TrimSpace(*token), CFClientID: *cfID, CFClientSecret: *cfSecret}
+	old, _ := loadConfig() // keep the floating window's preferences
+	cfg := config{Server: strings.TrimRight(*server, "/"), Token: strings.TrimSpace(*token), CFClientID: *cfID, CFClientSecret: *cfSecret, GUI: old.GUI}
 	email, err := newClient(cfg).whoami()
 	if err != nil {
 		return fmt.Errorf("couldn't sign in with that token: %w", err)
@@ -211,13 +248,9 @@ func cmdRecord(args []string) error {
 	noUpload := fs.Bool("no-upload", false, "")
 	maxDur := fs.Duration("max", 0, "")
 	mono := fs.Bool("mono", false, "")
-	home, _ := os.UserHomeDir()
-	baseDir := fs.String("dir", filepath.Join(home, "MeetRec"), "")
+	baseDir := fs.String("dir", defaultBaseDir(), "")
 	fs.Usage = usage
 	_ = fs.Parse(args)
-	if *noMic && *noSystem {
-		return errors.New("--no-mic and --no-system together leave nothing to record")
-	}
 	if *display < 0 || *display >= displayCount() {
 		return fmt.Errorf("no display %d (see meetrec displays)", *display)
 	}
@@ -230,69 +263,22 @@ func cmdRecord(args []string) error {
 		}
 	}
 
-	started := time.Now()
-	name := started.Format("2006-01-02 1504")
-	if *title != "" {
-		name += " " + regexp.MustCompile(`[\\/:*?"<>|]+`).ReplaceAllString(*title, "-")
-	}
-	dir := filepath.Join(*baseDir, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	sess, err := startSession(recOptions{BaseDir: *baseDir, Title: *title, Shots: *shots != "off", Display: *display,
+		Window: *window, NoMic: *noMic, NoSystem: *noSystem, Mono: *mono, MicGain: *micGain, SysGain: *sysGain})
+	if err != nil {
 		return err
 	}
 	fields := finishFields{Title: *title, Language: *lang, NotesLanguage: *notesLang, Context: *context_, NumSpeakers: *people}
 	if fields.Title == "" {
-		fields.Title = "Online meeting " + started.Format("2 Jan 15:04")
+		fields.Title = "Online meeting " + sess.started.Format("2 Jan 15:04")
 	}
-	b, _ := json.MarshalIndent(fields, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "meeting.json"), b, 0o644); err != nil {
+	if err := sess.writeFields(fields); err != nil {
 		return err
 	}
+	fields.ChannelLayout = sess.channelLayout
 
-	stereo := !*noMic && !*noSystem && !*mono
-	channels := 1
-	if stereo {
-		channels = 2
-		fields.ChannelLayout = "mic,system"
-	}
-	b, _ = json.MarshalIndent(fields, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "meeting.json"), b, 0o644); err != nil {
-		return err
-	}
-	wav, err := createWav(filepath.Join(dir, "audio.wav"), channels)
-	if err != nil {
-		return err
-	}
-
-	// status messages from the capture threads show up above the status line
-	var msgMu sync.Mutex
-	var msgs []string
-	status := func(s string) { msgMu.Lock(); msgs = append(msgs, s); msgMu.Unlock() }
-
-	ctx, cancel := context.WithCancel(context.Background())
-	mx := &mixer{micGain: float32(*micGain), sysGain: float32(*sysGain), out: wav, stereo: stereo}
-	var wg sync.WaitGroup
-	if !*noMic {
-		mx.mic = &ring{}
-		wg.Add(1)
-		go func() { defer wg.Done(); captureSource(ctx, srcMic, mx.mic, status) }()
-	}
-	if !*noSystem {
-		mx.sys = &ring{}
-		wg.Add(1)
-		go func() { defer wg.Done(); captureSource(ctx, srcSystem, mx.sys, status) }()
-	}
-	stop := make(chan struct{})
-	mixDone := make(chan struct{})
-	go func() { mx.run(stop); close(mixDone) }()
-
-	var shooter *shotTaker
-	if *shots != "off" {
-		shooter = newShotTaker(filepath.Join(dir, "shots"), *display, *window, mx.position, status)
-		go shooter.run(stop)
-	}
-
-	fmt.Printf("Recording to %s\n", dir)
-	if shooter != nil {
+	fmt.Printf("Recording to %s\n", sess.dir)
+	if sess.shooter != nil {
 		fmt.Println("Screenshots: shared slides / whiteboards in the meeting window, video tiles cropped out. Press x to pause.")
 	}
 	fmt.Println("Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screenshots")
@@ -308,84 +294,62 @@ func cmdRecord(args []string) error {
 	if *maxDur > 0 {
 		autoStop = time.After(*maxDur)
 	}
-	paused := false
-	silentWarned := false
 loop:
 	for {
 		select {
 		case <-sig:
 			break loop
 		case <-autoStop:
-			status("time limit reached")
+			sess.status("time limit reached")
 			break loop
 		case k := <-keys:
 			switch k {
 			case 'q', 'Q', 3, '\r', '\n':
 				break loop
 			case 'p', 'P':
-				paused = mx.togglePause()
+				sess.togglePause()
 			case 's', 'S':
-				if shooter != nil {
-					shooter.takeNow()
-				}
+				sess.screenshot()
 			case 'x', 'X':
-				if shooter != nil {
-					if shooter.togglePause() {
-						status("screenshots paused")
-					} else {
-						status("screenshots resumed")
-					}
+				if paused, ok := sess.toggleShots(); ok {
+					sess.status(map[bool]string{true: "screenshots paused", false: "screenshots resumed"}[paused])
 				}
 			}
 		case <-tick.C:
 		}
-		msgMu.Lock()
-		for _, m := range msgs {
+		for _, m := range sess.messages() {
 			fmt.Printf("\r\033[K  %s\n", m)
 		}
-		msgs = msgs[:0]
-		msgMu.Unlock()
-		line := fmt.Sprintf("● %s  %s", fmtDur(mx.position()), map[bool]string{true: "PAUSED", false: "REC"}[paused])
-		if mx.mic != nil {
-			line += "  mic " + meter(mx.mic.level())
+		line := fmt.Sprintf("● %s  %s", fmtDur(sess.position()), map[bool]string{true: "PAUSED", false: "REC"}[sess.isPaused()])
+		mic, pc := sess.levels()
+		if mic >= 0 {
+			line += "  mic " + meter(mic)
 		}
-		if mx.sys != nil {
-			line += "  pc " + meter(mx.sys.level())
+		if pc >= 0 {
+			line += "  pc " + meter(pc)
 		}
-		if shooter != nil {
-			line += fmt.Sprintf("  shots %d", shooter.taken())
+		if sess.shooter != nil {
+			line += fmt.Sprintf("  shots %d", sess.shotsTaken())
 		}
 		fmt.Printf("\r\033[K%s", line)
-		if !silentWarned && mx.position() > 20 && mx.mic == nil && mx.sys != nil && !mx.sys.active {
-			silentWarned = true
-			status("no PC audio yet: is the meeting audio playing on the default output device?")
-		}
 	}
 
 	restoreKeys()
 	signal.Stop(sig)
 	fmt.Print("\r\033[K")
-	close(stop)
-	<-mixDone
-	cancel()
-	wg.Wait()
-	if err := wav.close(); err != nil {
+	dur, err := sess.stop()
+	if err != nil {
 		return err
 	}
-	dur := mx.position()
-	n := 0
-	if shooter != nil {
-		n = shooter.taken()
-	}
-	fmt.Printf("Stopped: %s recorded, %d screenshot(s). Saved in %s\n", fmtDur(dur), n, dir)
+	fmt.Printf("Stopped: %s recorded, %d screenshot(s). Saved in %s\n", fmtDur(dur), sess.shotsTaken(), sess.dir)
 	if dur < 3 {
 		return errors.New("recording too short to send")
 	}
 	if *noUpload {
-		fmt.Printf("Upload later with: meetrec upload %q\n", dir)
+		fmt.Printf("Upload later with: meetrec upload %q\n", sess.dir)
 		return nil
 	}
-	return upload(cfg, dir, fields)
+	return upload(cfg, sess.dir, fields)
 }
 
 func fmtDur(sec float64) string {

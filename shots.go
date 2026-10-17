@@ -223,6 +223,12 @@ func (s *shotTaker) togglePause() bool {
 	return s.paused
 }
 
+func (s *shotTaker) isPaused() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paused
+}
+
 func (s *shotTaker) taken() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
