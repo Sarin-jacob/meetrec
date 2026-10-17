@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +22,8 @@ type recOptions struct {
 	Display          int
 	Window           string
 	NoMic, NoSystem  bool
+	MicDevice        string // a chosen microphone's device id ("" = Windows default)
+	App              string // record only this app's sound, by exe name ("" = all PC sound)
 	Mono             bool
 	MicGain, SysGain float64
 }
@@ -28,6 +31,7 @@ type recOptions struct {
 type session struct {
 	dir           string
 	started       time.Time
+	app           audioApp // the app being recorded (empty: all PC sound)
 	channelLayout string
 	mx            *mixer
 	wav           *wavWriter
@@ -74,7 +78,23 @@ func startSession(o recOptions) (*session, error) {
 		o.SysGain = 1
 	}
 	s := &session{started: time.Now()}
+	if o.App != "" && !o.NoSystem {
+		switch app, ok := resolveApp(o.App); {
+		case !appCaptureSupported():
+			s.status("recording one app needs Windows 11: recording all PC sound")
+		case !ok:
+			s.status(appDisplayName(o.App) + " isn't running: recording all PC sound")
+		default:
+			s.app = app
+		}
+	}
 	s.dir = filepath.Join(o.BaseDir, folderName(s.started, o.Title))
+	for n := 2; ; n++ { // two recordings started in the same minute get their own folders
+		if _, err := os.Stat(s.dir); os.IsNotExist(err) {
+			break
+		}
+		s.dir = filepath.Join(o.BaseDir, fmt.Sprintf("%s (%d)", folderName(s.started, o.Title), n))
+	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -96,12 +116,18 @@ func startSession(o recOptions) (*session, error) {
 	if !o.NoMic {
 		s.mx.mic = &ring{}
 		s.wg.Add(1)
-		go func() { defer s.wg.Done(); captureSource(ctx, srcMic, s.mx.mic, s.status) }()
+		go func() {
+			defer s.wg.Done()
+			captureSource(ctx, audioSource{kind: srcMic, deviceID: o.MicDevice}, s.mx.mic, s.status)
+		}()
 	}
 	if !o.NoSystem {
 		s.mx.sys = &ring{}
 		s.wg.Add(1)
-		go func() { defer s.wg.Done(); captureSource(ctx, srcSystem, s.mx.sys, s.status) }()
+		go func() {
+			defer s.wg.Done()
+			captureSource(ctx, audioSource{kind: srcSystem, app: s.app}, s.mx.sys, s.status)
+		}()
 	}
 	s.stopCh = make(chan struct{})
 	s.mixDone = make(chan struct{})
@@ -216,6 +242,9 @@ func (s *session) writeFields(f finishFields) error {
 // retitle renames the folder to include the title chosen after recording (best effort).
 func (s *session) retitle(title string) {
 	want := filepath.Join(filepath.Dir(s.dir), folderName(s.started, title))
+	if _, err := os.Stat(want); err == nil {
+		return // a folder with that name exists: keep ours
+	}
 	if want != s.dir {
 		if err := os.Rename(s.dir, want); err == nil {
 			s.dir = want

@@ -20,7 +20,11 @@ It's a single 8 MB program. Double-click it for a small floating recorder button
 
 Start **meetrec** from the Start menu (or double-click `meetrec.exe`). A small pill appears in the bottom-right corner; drag it anywhere. It shows the recording time and two level bars (your mic, the PC's sound), so you can see it's hearing the meeting.
 
-**Click it** for the menu: Start / Stop, Pause, Screenshot now, the spoken **language** and the number of **people** (remembered for next time), slide screenshots on/off, the recordings folder, **Hide to taskbar** and Quit.
+**Click it** for the menu: Start / Stop, Pause, Screenshot now, the spoken **language** and the number of **people** (remembered for next time), where the sound comes from (below), slide screenshots on/off, the recordings folder, **Hide to taskbar** and Quit.
+
+**Sound from:** *All PC sound* (the default: everything the PC plays), **only one app** (the apps that have played sound are listed, e.g. *Only Zoom*, *Only Teams*, *Only Chrome*), or *No PC sound* for an in-person meeting. Recording only the meeting app leaves out notification sounds, music and videos. The pill then shows that app's icon. If the app isn't running when you start, meetrec records all PC sound instead (so nothing is lost) and says so in the menu; if it closes mid-meeting, meetrec waits for it to come back. Recording one app needs Windows 11 (on Windows 10 those entries are greyed out).
+
+**Microphone:** *Off*, the *Windows default* (follows it when you switch headsets), or a specific microphone. Both choices are remembered and are fixed while recording.
 
 **Shortcuts** (while the pill is showing): **Ctrl+Alt+R** start / stop, **Ctrl+Alt+P** pause, **Ctrl+Alt+S** screenshot now, **Ctrl+Alt+X** pause screenshots.
 
@@ -46,6 +50,8 @@ Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screen
 | `--shots off` | no screenshots |
 | `--window W` | where to look for slides: `auto` (the meeting app's window, found automatically; the default), `screen`, or part of a window title (`meetrec windows` lists them) |
 | `--display N` | the screen to use when there's no meeting window (`meetrec displays`) |
+| `--app NAME` | only this app's sound, e.g. `zoom`, `ms-teams`, `chrome` (`meetrec sources` lists the apps that have played sound); needs Windows 11 |
+| `--mic NAME` | this microphone (part of its name, see `meetrec sources`) instead of the Windows default |
 | `--no-mic` / `--no-system` | only the PC's audio / only the mic |
 | `--mono` | mix mic and PC into one channel (half the file size, but no automatic "you" label or echo removal) |
 | `--max 2h` | stop automatically |
@@ -86,7 +92,8 @@ Known limits:
 ## What's possible and what isn't
 
 **Works**
-- **Any meeting app on Windows 10/11.** It records the PC's default output device ("loopback"), so it doesn't need to know about Zoom or Meet. It also follows the default device when you switch to headphones mid-meeting.
+- **Any meeting app on Windows 10/11.** By default it records the PC's default output device ("loopback"), so it doesn't need to know about Zoom or Meet. It also follows the default device when you switch to headphones mid-meeting.
+- **Just the meeting app (Windows 11).** Windows can capture one program and its helper processes on their own; meetrec uses that when you pick an app, so YouTube or a notification ping in the background stays out of the recording.
 - **Your mic and everyone else in one file**, kept in sync on separate channels, at the 16 kHz the speech models use. You're labelled by name automatically and speaker echo is removed.
 - **Slide and whiteboard screenshots** from the meeting window with video tiles cut out (see above). Press `s` to force one, or `x` to pause during anything private.
 - **Screenshots inside the minutes.** Gemini reads them (slide titles, numbers on screen) and embeds the useful ones under the related point. They also show in the meeting page, the `.docx`/`.md` downloads and Outline.
@@ -120,6 +127,7 @@ The icon, the manifest (modern Windows controls, DPI awareness) and the version 
 | File | |
 |---|---|
 | `capture_windows.go` | WASAPI capture: microphone + loopback, follows the default device |
+| `sources_windows.go` | microphones, apps playing sound, capturing a single app |
 | `audio.go` | resampling to 16 kHz, keeping the two sources in sync, crash-safe WAV |
 | `shots.go` | when to take a screenshot (last settled frame), preview + full quality |
 | `vision.go` | finding the shared content: layout, faces (pigo), motion, photo-like areas |

@@ -40,7 +40,13 @@ type guiPrefs struct {
 	Language string `json:"language,omitempty"` // last spoken language chosen
 	People   int    `json:"people,omitempty"`   // 0 = not sure
 	NoShots  bool   `json:"no_shots,omitempty"`
-	X        int32  `json:"x,omitempty"` // overlay position (0,0 = default corner)
+	NoMic    bool   `json:"no_mic,omitempty"`    // record without the microphone
+	MicID    string `json:"mic_id,omitempty"`    // a chosen microphone ("" = Windows default)
+	MicName  string `json:"mic_name,omitempty"`  // its name, for the menu when it's unplugged
+	NoSystem bool   `json:"no_system,omitempty"` // no PC sound (an in-person meeting)
+	App      string `json:"app,omitempty"`       // only this app's sound, by exe name ("" = all PC sound)
+	AppPath  string `json:"app_path,omitempty"`  // where that app lives, for its icon
+	X        int32  `json:"x,omitempty"`         // overlay position (0,0 = default corner)
 	Y        int32  `json:"y,omitempty"`
 }
 
@@ -92,7 +98,9 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if os.Args[1] != "gui" && os.Args[1] != "uninstall" {
+	switch os.Args[1] {
+	case "gui", "uninstall", "version", "--version", "help", "-h", "--help":
+	default:
 		if msg, err := install(); err != nil {
 			fmt.Fprintln(os.Stderr, "note: couldn't install meetrec:", err)
 		} else if msg != "" {
@@ -113,6 +121,8 @@ func main() {
 		err = cmdRecord(os.Args[2:])
 	case "upload":
 		err = cmdUpload(os.Args[2:])
+	case "sources":
+		err = cmdSources()
 	case "displays":
 		for i := 0; i < displayCount(); i++ {
 			fmt.Println(displayInfo(i))
@@ -144,6 +154,7 @@ func usage() {
                                                meetrec.exe, or Start menu → meetrec)
   meetrec record [options]                     record in this terminal; press q to stop, then it uploads
   meetrec upload FOLDER                        upload (or finish uploading) a recording
+  meetrec sources                              list microphones, and apps playing sound (for --mic / --app)
   meetrec displays                             list screens for --display
   meetrec windows                              list windows for --window
   meetrec uninstall                            remove meetrec from PATH and the Start menu
@@ -158,6 +169,9 @@ record options:
   --window W          where to look for slides: auto (the meeting app's window, found
                       automatically), screen, or part of a window title (meetrec windows)
   --display N         the screen to use when there's no meeting window (default 0)
+  --app NAME          record only this app's sound (e.g. zoom, ms-teams, chrome; see meetrec
+                      sources), not every sound the PC makes. Needs Windows 11
+  --mic NAME          use this microphone (part of its name; see meetrec sources)
   --no-mic            only the PC's audio (e.g. you're on headphones and muted)
   --no-system         only the microphone (an in-person meeting)
   --mic-gain X        mic volume factor (default 1.0)
@@ -241,6 +255,8 @@ func cmdRecord(args []string) error {
 	shots := fs.String("shots", "auto", "")
 	display := fs.Int("display", 0, "")
 	window := fs.String("window", "auto", "")
+	app := fs.String("app", "", "")
+	micName := fs.String("mic", "", "")
 	noMic := fs.Bool("no-mic", false, "")
 	noSystem := fs.Bool("no-system", false, "")
 	micGain := fs.Float64("mic-gain", 1.0, "")
@@ -263,8 +279,26 @@ func cmdRecord(args []string) error {
 		}
 	}
 
+	micID := ""
+	if *micName != "" {
+		mics, _, _ := listMics()
+		for _, m := range mics {
+			if strings.Contains(strings.ToLower(m.Name), strings.ToLower(*micName)) {
+				micID = m.ID
+				break
+			}
+		}
+		if micID == "" {
+			return fmt.Errorf("no microphone matching %q (see meetrec sources)", *micName)
+		}
+	}
+	appExe := strings.ToLower(*app)
+	if appExe != "" && !strings.HasSuffix(appExe, ".exe") {
+		appExe += ".exe"
+	}
 	sess, err := startSession(recOptions{BaseDir: *baseDir, Title: *title, Shots: *shots != "off", Display: *display,
-		Window: *window, NoMic: *noMic, NoSystem: *noSystem, Mono: *mono, MicGain: *micGain, SysGain: *sysGain})
+		Window: *window, NoMic: *noMic, NoSystem: *noSystem, MicDevice: micID, App: appExe, Mono: *mono,
+		MicGain: *micGain, SysGain: *sysGain})
 	if err != nil {
 		return err
 	}
@@ -278,6 +312,9 @@ func cmdRecord(args []string) error {
 	fields.ChannelLayout = sess.channelLayout
 
 	fmt.Printf("Recording to %s\n", sess.dir)
+	if sess.app.Exe != "" {
+		fmt.Printf("PC sound: only %s\n", sess.app.Name)
+	}
 	if sess.shooter != nil {
 		fmt.Println("Screenshots: shared slides / whiteboards in the meeting window, video tiles cropped out. Press x to pause.")
 	}
@@ -350,6 +387,39 @@ loop:
 		return nil
 	}
 	return upload(cfg, sess.dir, fields)
+}
+
+func cmdSources() error {
+	mics, def, err := listMics()
+	if err != nil {
+		return err
+	}
+	fmt.Println("Microphones (--mic NAME):")
+	if len(mics) == 0 {
+		fmt.Println("  none found")
+	}
+	for _, m := range mics {
+		mark := ""
+		if m.Name == def {
+			mark = "  (Windows default)"
+		}
+		fmt.Printf("  %s%s\n", m.Name, mark)
+	}
+	fmt.Println("\nApps with sound (--app NAME):")
+	apps, err := listAudioApps()
+	if err != nil {
+		return err
+	}
+	if len(apps) == 0 {
+		fmt.Println("  none right now (an app shows up once it has played sound)")
+	}
+	for _, a := range apps {
+		fmt.Printf("  %-10s %s\n", strings.TrimSuffix(a.Exe, ".exe"), a.Name)
+	}
+	if !appCaptureSupported() {
+		fmt.Println("\nRecording a single app needs Windows 11 (build 20348+); this PC records all PC sound.")
+	}
+	return nil
 }
 
 func fmtDur(sec float64) string {

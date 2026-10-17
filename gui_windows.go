@@ -88,6 +88,9 @@ var (
 	pCreateDIBSection              = gdi32.NewProc("CreateDIBSection")
 	pCreateBitmap                  = gdi32.NewProc("CreateBitmap")
 	pShellExecuteW                 = shell32.NewProc("ShellExecuteW")
+	pExtractIconExW                = shell32.NewProc("ExtractIconExW")
+	pDrawIconEx                    = user32.NewProc("DrawIconEx")
+	pDestroyIcon                   = user32.NewProc("DestroyIcon")
 )
 
 const (
@@ -239,6 +242,14 @@ const (
 	cmdQuit
 	cmdLangBase   = 100
 	cmdPeopleBase = 200
+	cmdAllSound   = 300 // "Sound from" menu: all PC sound
+	cmdAppBase    = 301 // ... one of the apps listed
+	cmdAppMissing = 398 // ... the remembered app, not running now
+	cmdNoSound    = 399 // ... no PC sound
+	cmdMicOff     = 400 // "Microphone" menu
+	cmdMicDefault = 401
+	cmdMicBase    = 402
+	cmdMicMissing = 499
 )
 
 type finishForm struct {
@@ -274,6 +285,12 @@ type gui struct {
 	winFrom             rect32
 
 	fin finishForm
+
+	// sources offered in the last menu (ids refer into these)
+	menuApps []audioApp
+	menuMics []micDevice
+	appIcon  uintptr // icon of the app whose sound is recorded (0 = none)
+	iconPath string
 
 	upMu   sync.Mutex
 	upText string
@@ -362,11 +379,12 @@ func runGUI() {
 	g.scale = float64(dpi) / 96
 	g.font = makeFont(10, 400)
 	g.fontBold = makeFont(10, 600)
-	g.w, g.h = g.px(176), g.px(40)
+	g.w, g.h = g.px(196), g.px(40)
 	g.createWindows()
 	if !g.loggedIn {
 		g.note = "not signed in: recordings are kept but can't be sent yet"
 	}
+	g.loadAppIcon(g.cfg.GUI.AppPath)
 
 	var m msg
 	for {
@@ -500,6 +518,9 @@ func (g *gui) show() {
 
 func (g *gui) updateTaskbar() {
 	text, color := g.statusText()
+	if name := g.soundName(); name != "" {
+		text += " · " + name
+	}
 	pSetWindowTextW.Call(g.taskbar, uintptr(unsafe.Pointer(u16("meetrec – "+text))))
 	g.setTaskbarIcon(color)
 }
@@ -712,6 +733,7 @@ func (g *gui) draw(hdc uintptr) {
 	}
 
 	right := w - g.px(12)
+	iconSize := g.px(20)
 	if g.phase == phRecording {
 		// mic and PC level bars
 		mic, pc := g.sess.levels()
@@ -731,6 +753,16 @@ func (g *gui) draw(hdc uintptr) {
 			fill(rect32{x, top + bh - lh, x + bw, top + bh}, rgb(90, 200, 120))
 		}
 		right = w - g.px(34)
+	}
+	// whose sound: the app's icon (or its short name when it has none)
+	if name := g.soundName(); name != "" {
+		if g.appIcon != 0 {
+			x := right - iconSize
+			pDrawIconEx.Call(mem, uintptr(x), uintptr((h-iconSize)/2), g.appIcon, uintptr(iconSize), uintptr(iconSize), 0, 0, 3)
+			right = x - g.px(6)
+		} else {
+			text += " · " + shorten(name, 8)
+		}
 	}
 
 	pSetBkMode.Call(mem, 1) // TRANSPARENT
@@ -816,6 +848,130 @@ func (g *gui) hotkey(id uintptr) {
 
 func (g *gui) canStart() bool { return g.phase == phIdle || g.phase == phResult }
 
+// ---------------------------------------------------------------- sources
+
+// soundName: the app whose sound is (or will be) recorded; "" for all PC sound.
+func (g *gui) soundName() string {
+	if g.sess != nil && (g.phase == phRecording || g.phase == phFinishing) {
+		return g.sess.app.Name
+	}
+	if g.cfg.GUI.App != "" && !g.cfg.GUI.NoSystem {
+		return appDisplayName(g.cfg.GUI.App)
+	}
+	return ""
+}
+
+func (g *gui) loadAppIcon(path string) {
+	if path == g.iconPath {
+		return
+	}
+	if g.appIcon != 0 {
+		pDestroyIcon.Call(g.appIcon)
+		g.appIcon = 0
+	}
+	g.iconPath = path
+	if path == "" {
+		return
+	}
+	var large uintptr
+	if n, _, _ := pExtractIconExW.Call(uintptr(unsafe.Pointer(u16(path))), 0, uintptr(unsafe.Pointer(&large)), 0, 1); n > 0 && large != 0 {
+		g.appIcon = large
+	}
+}
+
+func (g *gui) soundMenu(add func(m uintptr, flags uintptr, id int, text string), check func(bool) uintptr, grayed uintptr) (uintptr, string) {
+	m, _, _ := pCreatePopupMenu.Call()
+	prefs := g.cfg.GUI
+	add(m, grayed|check(prefs.App == "" && !prefs.NoSystem), cmdAllSound, "All PC sound")
+	pAppendMenuW.Call(m, mfSeparator, 0, 0)
+	supported := appCaptureSupported()
+	appFlags := grayed
+	if !supported {
+		appFlags = mfGrayed
+		add(m, mfGrayed, 0, "Only one app: needs Windows 11")
+	}
+	g.menuApps = nil
+	if grayed == 0 {
+		apps, err := listAudioApps()
+		if err != nil {
+			log.Printf("listing apps: %v", err)
+		}
+		self := strings.ToLower(filepath.Base(selfPath()))
+		for _, a := range apps {
+			if a.Exe != self && len(g.menuApps) < 20 {
+				g.menuApps = append(g.menuApps, a)
+			}
+		}
+	}
+	listed := false
+	for i, a := range g.menuApps {
+		on := !prefs.NoSystem && strings.EqualFold(a.Exe, prefs.App)
+		listed = listed || on
+		add(m, appFlags|check(on), cmdAppBase+i, "Only "+a.Name)
+	}
+	if prefs.App != "" && !prefs.NoSystem && !listed {
+		label := "Only " + appDisplayName(prefs.App)
+		if grayed == 0 {
+			label += " (not playing now)"
+		}
+		add(m, appFlags|mfChecked, cmdAppMissing, label)
+	}
+	if len(g.menuApps) == 0 && grayed == 0 && supported {
+		add(m, mfGrayed, 0, "(apps show up here once they play sound)")
+	}
+	pAppendMenuW.Call(m, mfSeparator, 0, 0)
+	add(m, grayed|check(prefs.NoSystem), cmdNoSound, "No PC sound (in-person meeting)")
+	label := "All PC sound"
+	switch {
+	case prefs.NoSystem:
+		label = "none"
+	case prefs.App != "":
+		label = appDisplayName(prefs.App)
+	}
+	return m, "Sound from: " + label
+}
+
+func (g *gui) micMenu(add func(m uintptr, flags uintptr, id int, text string), check func(bool) uintptr, grayed uintptr) (uintptr, string) {
+	m, _, _ := pCreatePopupMenu.Call()
+	prefs := g.cfg.GUI
+	g.menuMics = nil
+	defName := ""
+	if grayed == 0 {
+		var err error
+		if g.menuMics, defName, err = listMics(); err != nil {
+			log.Printf("listing microphones: %v", err)
+		}
+	}
+	add(m, grayed|check(prefs.NoMic), cmdMicOff, "Off")
+	def := "Windows default"
+	if defName != "" {
+		def += " (" + shorten(defName, 40) + ")"
+	}
+	add(m, grayed|check(!prefs.NoMic && prefs.MicID == ""), cmdMicDefault, def)
+	pAppendMenuW.Call(m, mfSeparator, 0, 0)
+	found := false
+	for i, d := range g.menuMics {
+		on := !prefs.NoMic && d.ID == prefs.MicID
+		found = found || on
+		add(m, grayed|check(on), cmdMicBase+i, shorten(d.Name, 60))
+	}
+	if prefs.MicID != "" && !prefs.NoMic && !found {
+		label := shorten(prefs.MicName, 50)
+		if grayed == 0 {
+			label += " (unplugged)"
+		}
+		add(m, grayed|mfChecked, cmdMicMissing, label)
+	}
+	label := "default"
+	switch {
+	case prefs.NoMic:
+		label = "off"
+	case prefs.MicID != "":
+		label = shorten(prefs.MicName, 24)
+	}
+	return m, "Microphone: " + label
+}
+
 // ---------------------------------------------------------------- menu
 
 func (g *gui) menu() {
@@ -869,6 +1025,15 @@ func (g *gui) menu() {
 		add(people, mfString|check(n == g.cfg.GUI.People), cmdPeopleBase+n, peopleLabel(n))
 	}
 	pAppendMenuW.Call(menu, mfPopup, people, uintptr(unsafe.Pointer(u16("People: "+peopleLabel(g.cfg.GUI.People)))))
+	// where the sound comes from: chosen before recording, shown (greyed) during it
+	var fixed uintptr
+	if g.phase == phRecording || g.phase == phFinishing || g.phase == phUploading {
+		fixed = mfGrayed
+	}
+	sound, soundLabel := g.soundMenu(add, check, fixed)
+	pAppendMenuW.Call(menu, mfPopup|fixed, sound, uintptr(unsafe.Pointer(u16(soundLabel))))
+	mics, micLabel := g.micMenu(add, check, fixed)
+	pAppendMenuW.Call(menu, mfPopup|fixed, mics, uintptr(unsafe.Pointer(u16(micLabel))))
 	if g.phase != phRecording {
 		add(menu, mfString|check(!g.cfg.GUI.NoShots), cmdShotsPref, "Take slide screenshots")
 	}
@@ -924,6 +1089,30 @@ func (g *gui) command(id int) {
 	case id >= cmdPeopleBase && id <= cmdPeopleBase+maxPeople:
 		g.cfg.GUI.People = id - cmdPeopleBase
 		g.savePrefs()
+	case id == cmdAllSound:
+		g.cfg.GUI.App, g.cfg.GUI.AppPath, g.cfg.GUI.NoSystem = "", "", false
+		g.loadAppIcon("")
+		g.savePrefs()
+	case id >= cmdAppBase && id < cmdAppBase+len(g.menuApps):
+		a := g.menuApps[id-cmdAppBase]
+		g.cfg.GUI.App, g.cfg.GUI.AppPath, g.cfg.GUI.NoSystem = a.Exe, a.Path, false
+		g.loadAppIcon(a.Path)
+		g.savePrefs()
+	case id == cmdNoSound:
+		g.cfg.GUI.NoSystem = true
+		g.cfg.GUI.NoMic = false // something has to be recorded
+		g.savePrefs()
+	case id == cmdMicOff:
+		g.cfg.GUI.NoMic = true
+		g.cfg.GUI.NoSystem = false
+		g.savePrefs()
+	case id == cmdMicDefault:
+		g.cfg.GUI.NoMic, g.cfg.GUI.MicID, g.cfg.GUI.MicName = false, "", ""
+		g.savePrefs()
+	case id >= cmdMicBase && id < cmdMicBase+len(g.menuMics):
+		d := g.menuMics[id-cmdMicBase]
+		g.cfg.GUI.NoMic, g.cfg.GUI.MicID, g.cfg.GUI.MicName = false, d.ID, d.Name
+		g.savePrefs()
 	}
 	g.redraw()
 }
@@ -941,7 +1130,9 @@ func (g *gui) toggleShots() {
 // ---------------------------------------------------------------- record / stop / finish
 
 func (g *gui) start() {
-	sess, err := startSession(recOptions{BaseDir: defaultBaseDir(), Shots: !g.cfg.GUI.NoShots, Window: "auto"})
+	p := g.cfg.GUI
+	sess, err := startSession(recOptions{BaseDir: defaultBaseDir(), Shots: !p.NoShots, Window: "auto",
+		NoMic: p.NoMic, MicDevice: p.MicID, NoSystem: p.NoSystem, App: p.App})
 	if err != nil {
 		messageBox(g.overlay, "Couldn't start recording: "+err.Error(), mbIconWarning)
 		return
@@ -949,6 +1140,12 @@ func (g *gui) start() {
 	g.sess, g.phase, g.note = sess, phRecording, ""
 	if !g.loggedIn {
 		g.note = "not signed in: this recording will be kept but not sent"
+	}
+	// the icon shows whose sound is recorded (none when it fell back to all PC sound)
+	g.loadAppIcon(sess.app.Path)
+	if sess.app.Path != "" && sess.app.Path != p.AppPath {
+		g.cfg.GUI.AppPath = sess.app.Path
+		g.savePrefs()
 	}
 	g.meetingTitle = guessTitle()
 	// a usable meeting.json from the start, in case the PC dies mid-meeting

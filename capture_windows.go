@@ -3,11 +3,12 @@
 package main
 
 // Audio capture with WASAPI (pure Go via go-wca, no cgo):
-//   - "system" = loopback of the default output device: whatever the PC plays,
-//     i.e. the other people in Zoom / Meet / Teams / any app.
-//   - "mic"    = the default recording device: you.
-// Each source runs on its own OS thread (COM apartments are per thread) and follows
-// the Windows default device, so switching to headphones mid-meeting keeps working.
+//   - "PC sound" = loopback of the default output device: whatever the PC plays,
+//     i.e. the other people in Zoom / Meet / Teams / any app; or, when an app is
+//     chosen, only that app (see sources_windows.go).
+//   - "mic"      = the default recording device (or a chosen one): you.
+// Each source runs on its own OS thread (COM apartments are per thread). Default
+// devices are followed, so switching to headphones mid-meeting keeps working.
 
 import (
 	"context"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wca/pkg/wca"
+	"golang.org/x/sys/windows"
 )
 
 type sourceKind int
@@ -29,22 +31,32 @@ const (
 	srcSystem
 )
 
-func (k sourceKind) String() string {
-	if k == srcMic {
+// audioSource says what one capture thread records.
+type audioSource struct {
+	kind     sourceKind
+	deviceID string   // mic: a chosen device ("" = the Windows default)
+	app      audioApp // PC sound: only this app ("" Exe = everything the PC plays)
+}
+
+func (s audioSource) String() string {
+	switch {
+	case s.kind == srcMic:
 		return "mic"
+	case s.app.Exe != "":
+		return s.app.Name + " sound"
 	}
-	return "system audio"
+	return "PC sound"
 }
 
 // captureSource streams mono float32 samples at TargetRate into sink until ctx ends.
 // It reopens the device when it disappears or the Windows default changes.
-func captureSource(ctx context.Context, kind sourceKind, sink *ring, status func(string)) {
+func captureSource(ctx context.Context, src audioSource, sink *ring, status func(string)) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
 		// S_FALSE (already initialised) is fine
 		if oleErr, ok := err.(*ole.OleError); !ok || oleErr.Code() != 1 {
-			status(fmt.Sprintf("%s: COM init failed: %v", kind, err))
+			status(fmt.Sprintf("%s: COM init failed: %v", src, err))
 			return
 		}
 	}
@@ -53,16 +65,19 @@ func captureSource(ctx context.Context, kind sourceKind, sink *ring, status func
 	backoff := time.Second
 	lastErr := ""
 	for ctx.Err() == nil {
-		err := captureOnce(ctx, kind, sink, status)
+		err := captureOnce(ctx, &src, sink, status)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil && err.Error() != lastErr { // say it once, keep retrying quietly
 			lastErr = err.Error()
-			if kind == srcMic && strings.HasPrefix(lastErr, "no default") {
+			switch {
+			case src.kind == srcMic && strings.HasPrefix(lastErr, "no default"):
 				status("no microphone found: recording PC audio only (plug one in and it will be picked up)")
-			} else {
-				status(fmt.Sprintf("%s: %v (retrying)", kind, err))
+			case src.app.Exe != "" && strings.HasPrefix(lastErr, "app closed"):
+				status(fmt.Sprintf("%s closed: waiting for it to come back", src.app.Name))
+			default:
+				status(fmt.Sprintf("%s: %v (retrying)", src, err))
 			}
 		} else if err == nil {
 			lastErr = ""
@@ -78,60 +93,120 @@ func captureSource(ctx context.Context, kind sourceKind, sink *ring, status func
 	}
 }
 
-// captureOnce runs until the device fails, the default device changes, or ctx ends.
-func captureOnce(ctx context.Context, kind sourceKind, sink *ring, status func(string)) error {
+// openSource gets an audio client for src, with the format to request and the stream
+// flags, and a function that says when to reopen (default device changed, app gone).
+func openSource(enum *wca.IMMDeviceEnumerator, src *audioSource, status func(string)) (
+	client *wca.IAudioClient, wfx *wca.WAVEFORMATEX, flags uint32, reopen func() bool, cleanup func(), err error) {
+	cleanup = func() {}
+	if src.kind == srcSystem && src.app.Exe != "" {
+		// one app: find it again if it was restarted
+		if !appRunning(src.app.PID) {
+			app, ok := resolveApp(src.app.Exe)
+			if !ok {
+				return nil, nil, 0, nil, cleanup, fmt.Errorf("app closed")
+			}
+			src.app = app
+		}
+		client, err = activateAppLoopback(src.app.PID)
+		if err != nil {
+			return nil, nil, 0, nil, cleanup, fmt.Errorf("capturing %s: %w", src.app.Name, err)
+		}
+		// app capture has no mix format of its own: ask for 48 kHz stereo float,
+		// Windows converts whatever the app plays
+		f := &wca.WAVEFORMATEX{WFormatTag: 3, NChannels: 2, NSamplesPerSec: 48000, NAvgBytesPerSec: 48000 * 8,
+			NBlockAlign: 8, WBitsPerSample: 32}
+		const autoConvert, srcDefaultQuality, eventCallback = 0x80000000, 0x08000000, 0x00040000
+		pid := src.app.PID
+		return client, f, wca.AUDCLNT_STREAMFLAGS_LOOPBACK | eventCallback | autoConvert | srcDefaultQuality,
+			func() bool { return !appRunning(pid) }, func() {}, nil
+	}
+
+	flow := uint32(wca.ECapture)
+	if src.kind == srcSystem {
+		flow = wca.ERender
+	}
+	var dev *wca.IMMDevice
+	followDefault := true
+	if src.kind == srcMic && src.deviceID != "" {
+		if dev, err = getDevice(enum, src.deviceID); err == nil {
+			var state uint32
+			if dev.GetState(&state) != nil || state != wca.DEVICE_STATE_ACTIVE {
+				dev.Release()
+				dev, err = nil, fmt.Errorf("unplugged")
+			}
+		}
+		if err != nil {
+			status("the chosen microphone isn't available: using the Windows default")
+			src.deviceID, err = "", nil
+		} else {
+			followDefault = false
+		}
+	}
+	if dev == nil {
+		if err := enum.GetDefaultAudioEndpoint(flow, wca.EConsole, &dev); err != nil {
+			return nil, nil, 0, nil, cleanup, fmt.Errorf("no default %s device", map[bool]string{true: "mic", false: "output"}[src.kind == srcMic])
+		}
+	}
+	var devID string
+	_ = dev.GetId(&devID)
+	client, err = activateAudioClient(dev)
+	dev.Release()
+	if err != nil {
+		return nil, nil, 0, nil, cleanup, fmt.Errorf("activate: %w", err)
+	}
+	if err = client.GetMixFormat(&wfx); err != nil {
+		client.Release()
+		return nil, nil, 0, nil, cleanup, fmt.Errorf("mix format: %w", err)
+	}
+	cleanup = func() { ole.CoTaskMemFree(uintptr(unsafe.Pointer(wfx))) }
+	if src.kind == srcSystem {
+		flags = wca.AUDCLNT_STREAMFLAGS_LOOPBACK
+	}
+	reopen = func() bool {
+		if !followDefault {
+			return false
+		}
+		var d *wca.IMMDevice
+		if enum.GetDefaultAudioEndpoint(flow, wca.EConsole, &d) != nil {
+			return false
+		}
+		defer d.Release()
+		var id string
+		_ = d.GetId(&id)
+		return id != "" && id != devID
+	}
+	return client, wfx, flags, reopen, cleanup, nil
+}
+
+// captureOnce runs until the device fails, the default device changes (or the app
+// closes), or ctx ends.
+func captureOnce(ctx context.Context, src *audioSource, sink *ring, status func(string)) error {
 	var enum *wca.IMMDeviceEnumerator
 	if err := wca.CoCreateInstance(wca.CLSID_MMDeviceEnumerator, 0, wca.CLSCTX_ALL, wca.IID_IMMDeviceEnumerator, &enum); err != nil {
 		return fmt.Errorf("device enumerator: %w", err)
 	}
 	defer enum.Release()
 
-	flow := uint32(wca.ECapture)
-	if kind == srcSystem {
-		flow = wca.ERender
-	}
-	defaultID := func() string {
-		var dev *wca.IMMDevice
-		if err := enum.GetDefaultAudioEndpoint(flow, wca.EConsole, &dev); err != nil {
-			return ""
-		}
-		defer dev.Release()
-		var id string
-		_ = dev.GetId(&id)
-		return id
-	}
-
-	var dev *wca.IMMDevice
-	if err := enum.GetDefaultAudioEndpoint(flow, wca.EConsole, &dev); err != nil {
-		return fmt.Errorf("no default %s device", kind)
-	}
-	defer dev.Release()
-	var devID string
-	_ = dev.GetId(&devID)
-
-	client, err := activateAudioClient(dev)
+	client, wfx, flags, reopen, cleanup, err := openSource(enum, src, status)
 	if err != nil {
-		return fmt.Errorf("activate: %w", err)
+		return err
 	}
 	defer client.Release()
-
-	var wfx *wca.WAVEFORMATEX
-	if err := client.GetMixFormat(&wfx); err != nil {
-		return fmt.Errorf("mix format: %w", err)
-	}
-	defer ole.CoTaskMemFree(uintptr(unsafe.Pointer(wfx)))
+	defer cleanup()
 	format, err := describeFormat(wfx)
 	if err != nil {
 		return err
 	}
-
-	var flags uint32
-	if kind == srcSystem {
-		flags = wca.AUDCLNT_STREAMFLAGS_LOOPBACK
-	}
 	const bufferDuration = 2_000_000 // 200 ms in 100 ns units
 	if err := client.Initialize(wca.AUDCLNT_SHAREMODE_SHARED, flags, bufferDuration, 0, wfx, nil); err != nil {
 		return fmt.Errorf("initialize: %w", err)
+	}
+	if flags&0x00040000 != 0 { // event-driven streams need an event even though we poll
+		ev, _ := windows.CreateEvent(nil, 0, 0, nil)
+		defer windows.CloseHandle(ev)
+		if err := client.SetEventHandle(uintptr(ev)); err != nil {
+			return fmt.Errorf("event: %w", err)
+		}
 	}
 	var cap *wca.IAudioCaptureClient
 	if err := client.GetService(wca.IID_IAudioCaptureClient, &cap); err != nil {
@@ -143,7 +218,7 @@ func captureOnce(ctx context.Context, kind sourceKind, sink *ring, status func(s
 	}
 	defer client.Stop()
 
-	status(fmt.Sprintf("%s: %d Hz, %d ch", kind, format.rate, format.channels))
+	status(fmt.Sprintf("%s: %d Hz, %d ch", src, format.rate, format.channels))
 	rs := newResampler(format.rate, TargetRate)
 	mono := make([]float32, 0, 4800)
 	tick := time.NewTicker(10 * time.Millisecond)
@@ -183,11 +258,13 @@ func captureOnce(ctx context.Context, kind sourceKind, sink *ring, status func(s
 			}
 			sink.write(rs.process(mono))
 		}
-		// Follow the Windows default device (e.g. plugging in headphones)
 		if time.Since(lastCheck) > 2*time.Second {
 			lastCheck = time.Now()
-			if id := defaultID(); id != "" && id != devID {
-				status(fmt.Sprintf("%s: default device changed, switching", kind))
+			if reopen() {
+				if src.app.Exe != "" {
+					return fmt.Errorf("app closed")
+				}
+				status(fmt.Sprintf("%s: default device changed, switching", src))
 				return nil
 			}
 		}
