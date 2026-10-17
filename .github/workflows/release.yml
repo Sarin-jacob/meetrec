@@ -1,0 +1,32 @@
+# Push a tag like v0.2.0 to build meetrec.exe and publish it as a GitHub release.
+# The web app's Settings page links to the latest release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./... && go test ./...
+      - name: Build
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME#v}" -o meetrec.exe .
+          ./meetrec.exe version
+          sha256sum meetrec.exe > meetrec.exe.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" meetrec.exe meetrec.exe.sha256 --title "meetrec $GITHUB_REF_NAME" --generate-notes
