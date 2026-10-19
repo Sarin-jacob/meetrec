@@ -32,6 +32,8 @@ Start **meetrec** from the Start menu (or double-click `meetrec.exe`). A small p
 
 **When you stop**, a small window asks for the meeting title (taken from Teams/Webex window titles when it can), the language and the number of people. **Upload** sends it; **Discard** keeps the recording in its folder without sending it. If you don't touch it, it uploads with those defaults after a minute. The pill then shows the upload progress and "Sent ✓".
 
+**Not uploaded (N)** appears in the menu when recordings are waiting to be sent: discarded ones, ones made while not signed in, or uploads that failed. Each recording (date, title, length) has **Upload** and **Open folder**, and **Upload all** sends them one after another (an interrupted upload continues where it stopped).
+
 The pill hides itself from screen shares and recordings, so it never shows up in a presentation or in the screenshots.
 
 ## Recording in a terminal
@@ -118,7 +120,7 @@ go build -ldflags "-s -w" -o meetrec.exe .
 go test ./...
 ```
 
-The icon, the manifest (modern Windows controls, DPI awareness) and the version details live in `winres/` and are compiled into `rsrc_windows_amd64.syso`, which `go build` picks up. After changing them: `go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64`. Local builds report version `dev` and don't install themselves (set `MEETREC_INSTALL=1` to test that).
+The icon, the manifest (modern Windows controls, DPI awareness) and the version details live in `winres/` and are compiled into `rsrc_windows_amd64.syso`, which `go build` picks up. After changing them: `go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64`. Local builds report version `dev` and don't install themselves (set `MEETREC_INSTALL=1` to test that). `MEETREC_INSTANCE=test` runs a separate floating recorder next to the installed one (its own lock and window names), and `MEETREC_CONFIG` / `MEETREC_DIR` point it at a test sign-in and folder.
 
 **Releases:** pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`, which tests, builds `meetrec.exe` (with that version inside) and publishes it as a GitHub release. The web app's Settings page links to the latest one. A server that can't reach GitHub can serve its own copy instead: put `meetrec.exe` in `DATA_DIR/downloads/`.
 

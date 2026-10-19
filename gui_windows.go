@@ -240,16 +240,20 @@ const (
 	cmdOpenWeb
 	cmdHide
 	cmdQuit
-	cmdLangBase   = 100
-	cmdPeopleBase = 200
-	cmdAllSound   = 300 // "Sound from" menu: all PC sound
-	cmdAppBase    = 301 // ... one of the apps listed
-	cmdAppMissing = 398 // ... the remembered app, not running now
-	cmdNoSound    = 399 // ... no PC sound
-	cmdMicOff     = 400 // "Microphone" menu
-	cmdMicDefault = 401
-	cmdMicBase    = 402
-	cmdMicMissing = 499
+	cmdLangBase    = 100
+	cmdPeopleBase  = 200
+	cmdAllSound    = 300 // "Sound from" menu: all PC sound
+	cmdAppBase     = 301 // ... one of the apps listed
+	cmdAppMissing  = 398 // ... the remembered app, not running now
+	cmdNoSound     = 399 // ... no PC sound
+	cmdMicOff      = 400 // "Microphone" menu
+	cmdMicDefault  = 401
+	cmdMicBase     = 402
+	cmdMicMissing  = 499
+	cmdUploadAll   = 599 // "Not uploaded" menu
+	cmdUploadBase  = 600 // ... upload recording i
+	cmdOpenRecBase = 650 // ... open its folder
+	maxPendingMenu = 40
 )
 
 type finishForm struct {
@@ -286,20 +290,28 @@ type gui struct {
 
 	fin finishForm
 
-	// sources offered in the last menu (ids refer into these)
-	menuApps []audioApp
-	menuMics []micDevice
-	appIcon  uintptr // icon of the app whose sound is recorded (0 = none)
-	iconPath string
+	// sources and recordings offered in the last menu (ids refer into these)
+	menuApps    []audioApp
+	menuMics    []micDevice
+	menuPending []pendingRec
+	appIcon     uintptr // icon of the app whose sound is recorded (0 = none)
+	iconPath    string
 
-	upMu   sync.Mutex
-	upText string
-	upDone bool
-	upErr  error
-	upID   string
+	upMu      sync.Mutex
+	upQueue   []string // recording folders to send, in order
+	upCurrent string   // the one being sent (or that failed)
+	upCount   int      // how many in this batch
+	upText    string
+	upDone    bool
+	upErr     error
+	upID      string
 }
 
 var g *gui
+
+// MEETREC_INSTANCE (for development): a separate floating recorder with its own lock and
+// window names, so a test copy can run next to the installed one.
+var instance = os.Getenv("MEETREC_INSTANCE")
 
 // ---------------------------------------------------------------- start
 
@@ -355,9 +367,9 @@ func messageBox(owner uintptr, text string, flags uintptr) int {
 func runGUI() {
 	runtime.LockOSThread()
 	// one floating recorder at a time: a second launch just brings the first one back
-	mutexName := u16("Local\\meetrec-gui")
+	mutexName := u16("Local\\meetrec-gui" + instance)
 	if h, err := windows.CreateMutex(nil, false, mutexName); err == windows.ERROR_ALREADY_EXISTS {
-		if hw, _, _ := pFindWindowW.Call(uintptr(unsafe.Pointer(u16("meetrecOverlay"))), 0); hw != 0 {
+		if hw, _, _ := pFindWindowW.Call(uintptr(unsafe.Pointer(u16("meetrecOverlay"+instance))), 0); hw != 0 {
 			pPostMessageW.Call(hw, wmShowOverlay, 0, 0)
 		}
 		return
@@ -422,10 +434,10 @@ func registerClass(name string, proc uintptr, bg uintptr) {
 }
 
 func (g *gui) createWindows() {
-	registerClass("meetrecOverlay", windows.NewCallback(overlayProc), 0)
-	registerClass("meetrecTaskbar", windows.NewCallback(taskbarProc), 0)
+	registerClass("meetrecOverlay"+instance, windows.NewCallback(overlayProc), 0)
+	registerClass("meetrecTaskbar"+instance, windows.NewCallback(taskbarProc), 0)
 	btnFace, _, _ := pGetSysColorBrush.Call(15) // COLOR_BTNFACE
-	registerClass("meetrecFinish", windows.NewCallback(finishProc), btnFace)
+	registerClass("meetrecFinish"+instance, windows.NewCallback(finishProc), btnFace)
 
 	x, y := g.cfg.GUI.X, g.cfg.GUI.Y
 	if !g.onScreen(x, y) {
@@ -434,7 +446,7 @@ func (g *gui) createWindows() {
 		x, y = wa.Right-g.w-g.px(24), wa.Bottom-g.h-g.px(24)
 	}
 	g.overlay, _, _ = pCreateWindowExW.Call(wsExTopmost|wsExToolwindow|wsExLayered|wsExNoactivate,
-		uintptr(unsafe.Pointer(u16("meetrecOverlay"))), uintptr(unsafe.Pointer(u16("meetrec"))), wsPopup,
+		uintptr(unsafe.Pointer(u16("meetrecOverlay"+instance))), uintptr(unsafe.Pointer(u16("meetrec"))), wsPopup,
 		uintptr(x), uintptr(y), uintptr(g.w), uintptr(g.h), 0, 0, 0, 0)
 	pSetLayeredWindowAttributes.Call(g.overlay, 0, 238, 2) // LWA_ALPHA
 	rgn, _, _ := pCreateRoundRectRgn.Call(0, 0, uintptr(g.w+1), uintptr(g.h+1), uintptr(g.h), uintptr(g.h))
@@ -445,7 +457,7 @@ func (g *gui) createWindows() {
 	}
 
 	// the taskbar button shown while the pill is hidden: an off-screen, minimised window
-	g.taskbar, _, _ = pCreateWindowExW.Call(wsExAppwindow, uintptr(unsafe.Pointer(u16("meetrecTaskbar"))),
+	g.taskbar, _, _ = pCreateWindowExW.Call(wsExAppwindow, uintptr(unsafe.Pointer(u16("meetrecTaskbar"+instance))),
 		uintptr(unsafe.Pointer(u16("meetrec"))), wsCaption|wsSysmenu|wsMinimizebox,
 		uintptr(^uint32(31999)), uintptr(^uint32(31999)), 200, 50, 0, 0, 0, 0)
 	g.setTaskbarIcon(rgb(120, 120, 120))
@@ -800,14 +812,25 @@ func (g *gui) tick() {
 		done, err, id := g.upDone, g.upErr, g.upID
 		g.upMu.Unlock()
 		if done {
+			g.upMu.Lock()
+			dir, left := g.upCurrent, len(g.upQueue)
+			g.upMu.Unlock()
 			if err != nil {
-				log.Printf("upload failed: %v", err)
+				log.Printf("upload of %s failed: %v", dir, err)
 				g.result("Not sent: saved", rgb(235, 60, 50), 30*time.Second)
-				messageBox(0, fmt.Sprintf("Couldn't send the recording:\n%v\n\nIt's saved in\n%s\n\nTry again later in a terminal:\nmeetrec upload \"%s\"",
-					err, g.sess.dir, g.sess.dir), mbIconWarning)
+				more := ""
+				if left > 0 {
+					more = fmt.Sprintf("\n\n%d more waiting weren't tried.", left)
+				}
+				messageBox(0, fmt.Sprintf("Couldn't send the recording:\n%v\n\nIt's saved in\n%s\n\nTry again later from the menu: Not uploaded.%s",
+					err, dir, more), mbIconWarning)
 			} else {
-				log.Printf("sent %s as meeting %s", g.sess.dir, id)
-				g.result("Sent ✓", rgb(80, 190, 110), 8*time.Second)
+				log.Printf("sent %s as meeting %s", dir, id)
+				sent := "Sent ✓"
+				if g.upCount > 1 {
+					sent = fmt.Sprintf("Sent %d ✓", g.upCount)
+				}
+				g.result(sent, rgb(80, 190, 110), 8*time.Second)
 			}
 		}
 	}
@@ -972,6 +995,108 @@ func (g *gui) micMenu(add func(m uintptr, flags uintptr, id int, text string), c
 	return m, "Microphone: " + label
 }
 
+// pendingMenu: "Not uploaded (N)" → one entry per recording (Upload / Open folder), then
+// "Upload all". 0 when there's nothing waiting.
+func (g *gui) pendingMenu(add func(m uintptr, flags uintptr, id int, text string)) (uintptr, string) {
+	skip := ""
+	if g.sess != nil && g.phase == phRecording {
+		skip = g.sess.dir
+	}
+	g.menuPending = pendingRecordings(defaultBaseDir(), skip)
+	if len(g.menuPending) == 0 {
+		return 0, ""
+	}
+	if len(g.menuPending) > maxPendingMenu {
+		g.menuPending = g.menuPending[:maxPendingMenu]
+	}
+	var busy uintptr // one upload at a time, and not while recording
+	if !g.canStart() {
+		busy = mfGrayed
+	}
+	m, _, _ := pCreatePopupMenu.Call()
+	if busy != 0 {
+		add(m, mfGrayed, 0, "(can be sent once the current recording is done)")
+	}
+	for i, r := range g.menuPending {
+		item, _, _ := pCreatePopupMenu.Call()
+		add(item, busy, cmdUploadBase+i, "Upload")
+		add(item, 0, cmdOpenRecBase+i, "Open folder")
+		pAppendMenuW.Call(m, mfPopup, item, uintptr(unsafe.Pointer(u16(r.label()))))
+	}
+	pAppendMenuW.Call(m, mfSeparator, 0, 0)
+	all := "Upload all"
+	if len(g.menuPending) > 1 {
+		all = fmt.Sprintf("Upload all %d", len(g.menuPending))
+	}
+	add(m, busy, cmdUploadAll, all)
+	if !g.loggedIn {
+		add(m, mfGrayed, 0, "(sign in first: meetrec login in a terminal)")
+	}
+	return m, fmt.Sprintf("Not uploaded (%d)", len(g.menuPending))
+}
+
+// upload sends recording folders one after another, with their saved meeting.json.
+func (g *gui) upload(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	if !g.loggedIn {
+		messageBox(g.overlay, "meetrec isn't signed in yet. Sign in once in a terminal (the command is in the web app: "+
+			"Settings → Desktop recorder), then send the recordings from the menu: Not uploaded.", mbIconInfo)
+		return
+	}
+	g.phase = phUploading
+	g.upMu.Lock()
+	g.upQueue, g.upCount = append([]string(nil), dirs...), len(dirs)
+	g.upText, g.upDone, g.upErr, g.upID, g.upCurrent = "Sending…", false, nil, "", ""
+	g.upMu.Unlock()
+	cfg := g.cfg
+	go func() {
+		var id string
+		var err error
+		for n := 1; ; n++ {
+			g.upMu.Lock()
+			if len(g.upQueue) == 0 {
+				g.upMu.Unlock()
+				break
+			}
+			dir := g.upQueue[0]
+			g.upQueue = g.upQueue[1:]
+			g.upCurrent = dir
+			g.upMu.Unlock()
+			prefix := ""
+			if len(dirs) > 1 {
+				prefix = fmt.Sprintf("%d/%d ", n, len(dirs))
+			}
+			var fields finishFields
+			if fields, err = readFields(dir); err != nil {
+				break
+			}
+			id, err = newClient(cfg).uploadRecording(dir, fields, func(s string) {
+				t := "Sending…"
+				if m := percent.FindStringSubmatch(s); m != nil {
+					t = "Sending " + m[1] + "%"
+				} else if m := shotCount.FindStringSubmatch(s); m != nil {
+					t = "Shots " + m[1]
+				} else if strings.Contains(s, "retrying") {
+					t = "Retrying…"
+				}
+				g.upMu.Lock()
+				g.upText = prefix + t
+				g.upMu.Unlock()
+			})
+			if err != nil {
+				break
+			}
+			log.Printf("sent %s as meeting %s", dir, id)
+		}
+		g.upMu.Lock()
+		g.upDone, g.upErr, g.upID = true, err, id
+		g.upMu.Unlock()
+	}()
+	g.redraw()
+}
+
 // ---------------------------------------------------------------- menu
 
 func (g *gui) menu() {
@@ -1010,6 +1135,9 @@ func (g *gui) menu() {
 		add(menu, mfGrayed, 0, "Sending the recording…")
 	default:
 		add(menu, mfString, cmdStart, "Start recording\tCtrl+Alt+R")
+	}
+	if sub, label := g.pendingMenu(add); sub != 0 {
+		pAppendMenuW.Call(menu, mfPopup, sub, uintptr(unsafe.Pointer(u16(label))))
 	}
 	sep()
 	langs, _, _ := pCreatePopupMenu.Call()
@@ -1109,6 +1237,16 @@ func (g *gui) command(id int) {
 	case id == cmdMicDefault:
 		g.cfg.GUI.NoMic, g.cfg.GUI.MicID, g.cfg.GUI.MicName = false, "", ""
 		g.savePrefs()
+	case id == cmdUploadAll && g.canStart():
+		var dirs []string
+		for i := len(g.menuPending) - 1; i >= 0; i-- { // oldest first
+			dirs = append(dirs, g.menuPending[i].Dir)
+		}
+		g.upload(dirs)
+	case id >= cmdUploadBase && id < cmdUploadBase+len(g.menuPending) && g.canStart():
+		g.upload([]string{g.menuPending[id-cmdUploadBase].Dir})
+	case id >= cmdOpenRecBase && id < cmdOpenRecBase+len(g.menuPending):
+		_ = exec.Command("explorer", g.menuPending[id-cmdOpenRecBase].Dir).Start()
 	case id >= cmdMicBase && id < cmdMicBase+len(g.menuMics):
 		d := g.menuMics[id-cmdMicBase]
 		g.cfg.GUI.NoMic, g.cfg.GUI.MicID, g.cfg.GUI.MicName = false, d.ID, d.Name
@@ -1203,7 +1341,7 @@ func (g *gui) quit() {
 		}
 		g.emergencyStop("quit")
 	case phUploading:
-		if messageBox(g.overlay, "The recording is still being sent. Quit anyway?\n\nYou can finish later with: meetrec upload \""+g.sess.dir+"\"", mbYesNo|mbIconWarning) != idYes {
+		if messageBox(g.overlay, "A recording is still being sent. Quit anyway?\n\nIt's kept, and you can send it later from the menu: Not uploaded.", mbYesNo|mbIconWarning) != idYes {
 			return
 		}
 	case phFinishing:
@@ -1270,34 +1408,11 @@ func (g *gui) finish(send bool) {
 	if !g.loggedIn {
 		g.result("Saved, not sent", rgb(240, 170, 40), 30*time.Second)
 		messageBox(g.overlay, "meetrec isn't signed in yet, so the recording was saved but not sent:\n"+g.sess.dir+
-			"\n\nSign in once in a terminal (the command is in the web app: Settings → Desktop recorder), then run:\nmeetrec upload \""+
-			g.sess.dir+"\"", mbIconInfo)
+			"\n\nSign in once in a terminal (the command is in the web app: Settings → Desktop recorder), then send it from "+
+			"the menu: Not uploaded.", mbIconInfo)
 		return
 	}
-	g.phase = phUploading
-	g.upMu.Lock()
-	g.upText, g.upDone, g.upErr, g.upID = "Sending…", false, nil, ""
-	g.upMu.Unlock()
-	cfg, dir := g.cfg, g.sess.dir
-	go func() {
-		id, err := newClient(cfg).uploadRecording(dir, f, func(s string) {
-			t := "Sending…"
-			if m := percent.FindStringSubmatch(s); m != nil {
-				t = "Sending " + m[1] + "%"
-			} else if m := shotCount.FindStringSubmatch(s); m != nil {
-				t = "Shots " + m[1]
-			} else if strings.Contains(s, "retrying") {
-				t = "Retrying…"
-			}
-			g.upMu.Lock()
-			g.upText = t
-			g.upMu.Unlock()
-		})
-		g.upMu.Lock()
-		g.upDone, g.upErr, g.upID = true, err, id
-		g.upMu.Unlock()
-	}()
-	g.redraw()
+	g.upload([]string{g.sess.dir})
 }
 
 // people combo: index 0 = "Not sure", then 2, 3, ... maxPeople
@@ -1332,7 +1447,7 @@ func (g *gui) openFinish(dur float64) {
 	pSystemParametersInfoW.Call(0x30, 0, uintptr(unsafe.Pointer(&wa)), 0)
 	x, y := (wa.Left+wa.Right-W)/2, (wa.Top+wa.Bottom-H)/2
 	hw, _, _ := pCreateWindowExW.Call(wsExTopmost|wsExDlgmodalframe|wsExAppwindow,
-		uintptr(unsafe.Pointer(u16("meetrecFinish"))), uintptr(unsafe.Pointer(u16("meetrec – save the recording"))),
+		uintptr(unsafe.Pointer(u16("meetrecFinish"+instance))), uintptr(unsafe.Pointer(u16("meetrec – save the recording"))),
 		wsCaption|wsSysmenu, uintptr(x), uintptr(y), uintptr(W), uintptr(H), 0, 0, 0, 0)
 	g.fin = finishForm{hwnd: hw, left: autoSendSeconds}
 	if !g.loggedIn {
