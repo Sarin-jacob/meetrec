@@ -76,7 +76,10 @@ func (r *resampler) process(in []float32) []float32 {
 		out = append(out, r.hist[i]*(1-frac)+r.hist[i+1]*frac)
 		r.pos += r.step
 	}
-	drop := int(r.pos)
+	// Drop what's been used. With a big rate ratio (e.g. a 96 or 192 kHz device) the next
+	// output can lie beyond the samples we have: keep that remainder in pos, so those
+	// samples are skipped as they arrive.
+	drop := min(int(r.pos), len(r.hist))
 	r.hist = append(r.hist[:0], r.hist[drop:]...)
 	r.pos -= float64(drop)
 	return out

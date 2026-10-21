@@ -65,7 +65,7 @@ func captureSource(ctx context.Context, src audioSource, sink *ring, status func
 	backoff := time.Second
 	lastErr := ""
 	for ctx.Err() == nil {
-		err := captureOnce(ctx, &src, sink, status)
+		err := captureSafely(ctx, &src, sink, status)
 		if ctx.Err() != nil {
 			return
 		}
@@ -176,6 +176,17 @@ func openSource(enum *wca.IMMDeviceEnumerator, src *audioSource, status func(str
 		return id != "" && id != devID
 	}
 	return client, wfx, flags, reopen, cleanup, nil
+}
+
+// captureSafely runs captureOnce, turning a crash inside it into an error: the source is
+// restarted and the other source (and the file) keep going instead of the whole program dying.
+func captureSafely(ctx context.Context, src *audioSource, sink *ring, status func(string)) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("internal error, restarting: %v", r)
+		}
+	}()
+	return captureOnce(ctx, src, sink, status)
 }
 
 // captureOnce runs until the device fails, the default device changes (or the app

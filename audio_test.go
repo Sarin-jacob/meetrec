@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,5 +75,42 @@ func TestStereoWav(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if b[22] != 2 || len(b) != 44+64000 {
 		t.Fatalf("bad stereo wav: ch=%d len=%d", b[22], len(b))
+	}
+}
+
+// Devices running at high rates (96/192 kHz) with packets of any size: no crash, the right
+// number of output samples, and a tone keeps its level. (A 192 kHz mic crashed v0.4.0.)
+func TestResamplerHighRates(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	for _, rate := range []int{22050, 44100, 48000, 88200, 96000, 176400, 192000} {
+		r := newResampler(rate, TargetRate)
+		seconds := 3
+		in, out := 0, 0
+		var outBuf []float32
+		for in < rate*seconds {
+			n := 1 + rng.Intn(2000) // packets from 1 sample to ~2000
+			if rng.Intn(10) == 0 {
+				n = 512
+			}
+			chunk := make([]float32, n)
+			for i := range chunk {
+				chunk[i] = float32(0.5 * math.Sin(2*math.Pi*1000*float64(in+i)/float64(rate)))
+			}
+			in += n
+			o := r.process(chunk)
+			out += len(o)
+			outBuf = append(outBuf, o...)
+		}
+		want := in * TargetRate / rate
+		if out < want-70 || out > want+2 { // the filter holds back a few samples
+			t.Errorf("%d Hz: %d samples out for %d in, want about %d", rate, out, in, want)
+		}
+		var sum float64
+		for _, v := range outBuf[TargetRate/10:] {
+			sum += float64(v) * float64(v)
+		}
+		if rms := math.Sqrt(sum / float64(len(outBuf)-TargetRate/10)); rms < 0.33 || rms > 0.38 {
+			t.Errorf("%d Hz: 1 kHz tone RMS %.3f, want about 0.354", rate, rms)
+		}
 	}
 }
