@@ -124,6 +124,8 @@ const (
 	esAutoHScroll, enChange, bsDefPush     = 0x80, 0x300, 0x1
 	bsAutoCheckbox, bmGetCheck, bmSetCheck = 0x3, 0xF0, 0xF1
 	idOK, idCancel                         = 1, 2
+	// the finish window's other controls
+	idPersonalBox, idBadge, idCountdown, idNote, idPersonalLabel = 13, 14, 15, 16, 17
 
 	mbOK, mbYesNo, mbIconWarning, mbIconInfo, mbTopmost, mbSetForeground = 0x0, 0x4, 0x30, 0x40, 0x40000, 0x10000
 	idYes                                                                = 6
@@ -263,6 +265,9 @@ const (
 type finishForm struct {
 	hwnd, title, lang, people, countdown uintptr
 	personal                             uintptr // the "personal" checkbox (0 when not offered)
+	ok, badge                            uintptr // the Upload button; the "PERSONAL" badge
+	personalOn                           bool    // the checkbox is ticked
+	light                                bool    // high contrast: system colours, no dark theme
 	left                                 int     // seconds before uploading with the defaults; -1 = stopped
 	ready                                bool    // set up: changes from now on are the person's
 }
@@ -400,6 +405,9 @@ func runGUI() {
 	g.font = makeFont(10, 400)
 	g.fontBold = makeFont(10, 600)
 	g.w, g.h = g.px(196), g.px(40)
+	if !highContrast() {
+		darkMenus()
+	}
 	g.createWindows()
 	if !g.loggedIn {
 		g.note = "not signed in: recordings are kept but can't be sent yet"
@@ -445,9 +453,9 @@ func (g *gui) personal() bool { return g.cfg.GUI.Mode == "personal" }
 // The pill's colours: dark grey for work, dark green for personal.
 func (g *gui) pillColor() uintptr {
 	if g.personal() {
-		return rgb(20, 52, 34)
+		return rgb(21, 74, 44)
 	}
-	return rgb(32, 33, 38)
+	return dark.panel
 }
 
 var personalGreen = rgb(74, 222, 128)
@@ -825,7 +833,7 @@ func (g *gui) draw(hdc uintptr) {
 	}
 
 	pSetBkMode.Call(mem, 1) // TRANSPARENT
-	pSetTextColor.Call(mem, rgb(240, 240, 242))
+	pSetTextColor.Call(mem, dark.text)
 	f := g.font
 	if g.phase == phRecording {
 		f = g.fontBold
@@ -1532,22 +1540,31 @@ func (g *gui) openFinish(dur float64) {
 	hw, _, _ := pCreateWindowExW.Call(wsExTopmost|wsExDlgmodalframe|wsExAppwindow,
 		uintptr(unsafe.Pointer(u16("meetrecFinish"+instance))), uintptr(unsafe.Pointer(u16("meetrec – save the recording"))),
 		wsCaption|wsSysmenu, uintptr(x), uintptr(y), uintptr(W), uintptr(H), 0, 0, 0, 0)
-	g.fin = finishForm{hwnd: hw, left: autoSendSeconds}
+	g.fin = finishForm{hwnd: hw, left: autoSendSeconds, light: highContrast(), personalOn: g.personal()}
 	if !g.loggedIn {
 		g.fin.left = -1 // nothing to send to: don't count down
+	}
+	if !g.fin.light {
+		darkTitleBar(hw)
 	}
 
 	child := func(class, text string, style uintptr, x, y, w, h float64, id int) uintptr {
 		c, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(u16(class))), uintptr(unsafe.Pointer(u16(text))),
 			wsChild|wsVisible|style, uintptr(g.px(x)), uintptr(g.px(y)), uintptr(g.px(w)), uintptr(g.px(h)), hw, uintptr(id), 0, 0)
 		pSendMessageW.Call(c, wmSetFont, g.font, 1)
+		if !g.fin.light && (class == "EDIT" || class == "COMBOBOX") {
+			darkControl(c)
+		}
 		return c
 	}
 	shots := ""
 	if n := g.sess.shotsTaken(); n > 0 {
 		shots = fmt.Sprintf(" · %d screenshot(s)", n)
 	}
-	child("STATIC", "Recorded "+fmtDur(dur)+shots, 0, 16, 12, 380, 20, 0)
+	recorded := child("STATIC", "Recorded "+fmtDur(dur)+shots, 0, 16, 12, 270, 20, 0)
+	pSendMessageW.Call(recorded, wmSetFont, g.fontBold, 1)
+	g.fin.badge = child("STATIC", "● PERSONAL", ssRight, 286, 12, 110, 20, idBadge)
+	pSendMessageW.Call(g.fin.badge, wmSetFont, g.fontBold, 1)
 	child("STATIC", "Title", 0, 16, 44, 90, 20, 0)
 	g.fin.title = child("EDIT", g.defaultFields().Title, wsBorder|wsTabstop|esAutoHScroll, 110, 41, 286, 24, 10)
 	child("STATIC", "Language", 0, 16, 78, 90, 20, 0)
@@ -1565,20 +1582,27 @@ func (g *gui) openFinish(dur float64) {
 	}
 	pSendMessageW.Call(g.fin.people, cbSetCurSel, uintptr(peopleToIndex(g.cfg.GUI.People)), 0)
 	if offerPersonal {
-		g.fin.personal = child("BUTTON", "Personal: private to me, with my own context", wsTabstop|bsAutoCheckbox, 110, 142, 286, 24, 13)
-		if g.personal() {
+		// the box and its words apart: a themed checkbox draws its own text black, unreadable on dark
+		g.fin.personal = child("BUTTON", "", wsTabstop|bsAutoCheckbox, 110, 145, 18, 20, idPersonalBox)
+		child("STATIC", "Personal: private to me, with my own context", ssNotify, 132, 146, 264, 20, idPersonalLabel)
+		if g.fin.personalOn {
 			pSendMessageW.Call(g.fin.personal, bmSetCheck, 1, 0)
 		}
 	}
-	g.fin.countdown = child("STATIC", "", 0, 16, 148+off, 380, 20, 0)
-	child("STATIC", "Discard keeps the recording in its folder without sending it.", 0, 16, 172+off, 380, 20, 0)
+	g.fin.countdown = child("STATIC", "", 0, 16, 148+off, 380, 20, idCountdown)
+	child("STATIC", "Discard keeps the recording in its folder without sending it.", 0, 16, 172+off, 380, 20, idNote)
 	send := "Upload"
 	if !g.loggedIn {
 		send = "Save"
 	}
-	child("BUTTON", send, wsTabstop|bsDefPush, 196, 206+off, 96, 30, idOK)
-	child("BUTTON", "Discard", wsTabstop, 300, 206+off, 96, 30, idCancel)
+	okStyle, otherStyle := uintptr(bsDefPush), uintptr(0)
+	if !g.fin.light {
+		okStyle, otherStyle = bsOwnerDraw, bsOwnerDraw
+	}
+	g.fin.ok = child("BUTTON", send, wsTabstop|okStyle, 196, 206+off, 96, 30, idOK)
+	child("BUTTON", "Discard", wsTabstop|otherStyle, 300, 206+off, 96, 30, idCancel)
 	g.updateCountdown()
+	g.showPersonal()
 
 	pShowWindow.Call(hw, swShow)
 	pSetForegroundWindow.Call(hw)
@@ -1586,6 +1610,17 @@ func (g *gui) openFinish(dur float64) {
 	pSendMessageW.Call(g.fin.title, 0xB1, 0, ^uintptr(0)) // EM_SETSEL: select all, typing replaces it
 	pSetTimer.Call(hw, 2, 1000, 0)
 	g.fin.ready = true
+}
+
+// showPersonal: the badge, window title and button colour follow the "personal" checkbox.
+func (g *gui) showPersonal() {
+	show, title := uintptr(swHide), "meetrec – save the recording"
+	if g.fin.personalOn {
+		show, title = swShow, "meetrec – save the personal recording"
+	}
+	pShowWindow.Call(g.fin.badge, show)
+	pSetWindowTextW.Call(g.fin.hwnd, uintptr(unsafe.Pointer(u16(title))))
+	pInvalidateRect.Call(g.fin.ok, 0, 1)
 }
 
 func (g *gui) updateCountdown() {
@@ -1598,6 +1633,18 @@ func (g *gui) updateCountdown() {
 
 func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 	switch m {
+	case wmEraseBkgnd:
+		if !g.fin.light {
+			paintPanel(hwnd, wp)
+			return 1
+		}
+	case wmCtlColorStatic, wmCtlColorEdit, wmCtlColorListbox, wmCtlColorBtn:
+		if !g.fin.light {
+			return g.ctlColor(m, wp, lp)
+		}
+	case wmDrawItem:
+		g.drawButton(*(**drawitem)(unsafe.Pointer(&lp))) // lp points at a DRAWITEMSTRUCT owned by Windows
+		return 1
 	case wmTimer:
 		if g.fin.hwnd == hwnd && g.fin.left > 0 {
 			g.fin.left--
@@ -1615,11 +1662,17 @@ func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 			g.finish(true)
 		case id == idCancel:
 			g.finish(false)
-		case (id == 10 && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange) || id == 13:
-			if g.fin.ready && g.fin.left > 0 { // they're choosing: no automatic upload
-				g.fin.left = -1
-				g.updateCountdown()
+		case id == idPersonalLabel || id == idPersonalBox:
+			if id == idPersonalLabel { // clicking the words ticks the box too
+				on, _, _ := pSendMessageW.Call(g.fin.personal, bmGetCheck, 0, 0)
+				pSendMessageW.Call(g.fin.personal, bmSetCheck, 1-on, 0)
 			}
+			on, _, _ := pSendMessageW.Call(g.fin.personal, bmGetCheck, 0, 0)
+			g.fin.personalOn = on == 1
+			g.showPersonal()
+			g.stopCountdown()
+		case (id == 10 && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange):
+			g.stopCountdown()
 		}
 		return 0
 	case wmClose:
@@ -1628,4 +1681,12 @@ func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 	}
 	r, _, _ := pDefWindowProcW.Call(hwnd, m, wp, lp)
 	return r
+}
+
+// stopCountdown: they're choosing, so no automatic upload.
+func (g *gui) stopCountdown() {
+	if g.fin.ready && g.fin.left > 0 {
+		g.fin.left = -1
+		g.updateCountdown()
+	}
 }

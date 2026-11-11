@@ -32,6 +32,10 @@ Start **meetrec** from the Start menu (or double-click `meetrec.exe`). A small p
 
 **When you stop**, a small window asks for the meeting title (taken from Teams/Webex window titles when it can), the language and the number of people. **Upload** sends it; **Discard** keeps the recording in its folder without sending it. If you don't touch it, it uploads with those defaults after a minute. The pill then shows the upload progress and "Sent ✓".
 
+**Personal mode:** when an admin of Meeting Notes has turned personal mode on for you, the menu has **Personal (private to you, your own context)** and the window after stopping has a **Personal** checkbox. Personal recordings go to your private space in Meeting Notes: only you see them, and their minutes use your personal context instead of the team's. While it's on, the pill turns green and says *Record · Personal*, and the Upload button is green. The choice is remembered. If the server refuses a personal recording (personal mode was turned off), it's kept under **Not uploaded**; send it as a work meeting with `meetrec upload --mode work FOLDER`.
+
+The windows are dark, like the web app, and the menus too on Windows 10 1903 and later. In Windows' high contrast mode they keep the system colours.
+
 **Not uploaded (N)** appears in the menu when recordings are waiting to be sent: discarded ones, ones made while not signed in, or uploads that failed. Each recording (date, title, length) has **Upload** and **Open folder**, and **Upload all** sends them one after another (an interrupted upload continues where it stopped).
 
 The pill hides itself from screen shares and recordings, so it never shows up in a presentation or in the screenshots.
@@ -49,6 +53,7 @@ Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screen
 | `--lang` | spoken language: `hi`, `ml`, `ta`, `te`, `bn`, `mr`, `gu`, `kn`, `pa`… |
 | `--people N` | number of people, if you know it (better speaker labels) |
 | `--context "..."` | names and jargon, to help the minutes |
+| `--mode personal` | a personal recording: private to you, with your own context (an admin has to turn personal mode on for you) |
 | `--shots off` | no screenshots |
 | `--window W` | where to look for slides: `auto` (the meeting app's window, found automatically; the default), `screen`, or part of a window title (`meetrec windows` lists them) |
 | `--display N` | the screen to use when there's no meeting window (`meetrec displays`) |
@@ -59,7 +64,7 @@ Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screen
 | `--max 2h` | stop automatically |
 | `--no-upload` | keep it local; send later with `meetrec upload FOLDER` |
 
-**Where recordings go:** `~/MeetRec/<date time title>/` (or the folder in the `MEETREC_DIR` environment variable) holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped.
+**Where recordings go:** `~/MeetRec/<date time title>/` (or the folder in the `MEETREC_DIR` environment variable) holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped; `--mode work` or `--mode personal` sends it as the other kind.
 
 **You are labelled automatically.** Because your mic is on its own channel, the server knows which speech is yours and names that speaker with the name set in the web app (Settings → Your name). It also keeps learning your voice from these recordings, which helps phone recordings too.
 
