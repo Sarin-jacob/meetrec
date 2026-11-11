@@ -67,11 +67,20 @@ func (c *client) do(method, path string, body io.Reader, contentType string, out
 	return nil
 }
 
-func (c *client) whoami() (string, error) {
-	var me struct {
-		Email string `json:"email"`
-	}
+// account is who the token belongs to, and what they may do.
+type account struct {
+	Email           string `json:"email"`
+	PersonalAllowed bool   `json:"personal_allowed"` // personal mode (an admin turns it on)
+}
+
+func (c *client) me() (account, error) {
+	var me account
 	err := c.do("GET", "/api/device/me", nil, "", &me)
+	return me, err
+}
+
+func (c *client) whoami() (string, error) {
+	me, err := c.me()
 	return me.Email, err
 }
 
@@ -89,6 +98,20 @@ type finishFields struct {
 	Context       string `json:"context"`
 	NumSpeakers   int    `json:"num_speakers"`
 	ChannelLayout string `json:"channel_layout,omitempty"` // "mic,system" for two-channel recordings
+	// "personal": private to the person, with their own context. Left out for work
+	// recordings, so servers from before personal mode see the same request as always.
+	Mode string `json:"mode,omitempty"`
+}
+
+// modeField turns work|personal (the --mode option) into finishFields.Mode.
+func modeField(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "work":
+		return "", nil
+	case "personal":
+		return "personal", nil
+	}
+	return "", fmt.Errorf("--mode is work or personal, not %q", mode)
 }
 
 var shotName = regexp.MustCompile(`^shot-\d+-t([\d.]+)\.jpg$`)

@@ -44,6 +44,7 @@ type guiPrefs struct {
 	MicID    string `json:"mic_id,omitempty"`    // a chosen microphone ("" = Windows default)
 	MicName  string `json:"mic_name,omitempty"`  // its name, for the menu when it's unplugged
 	NoSystem bool   `json:"no_system,omitempty"` // no PC sound (an in-person meeting)
+	Mode     string `json:"mode,omitempty"`      // "personal", or "" for work
 	App      string `json:"app,omitempty"`       // only this app's sound, by exe name ("" = all PC sound)
 	AppPath  string `json:"app_path,omitempty"`  // where that app lives, for its icon
 	X        int32  `json:"x,omitempty"`         // overlay position (0,0 = default corner)
@@ -153,7 +154,8 @@ func usage() {
   meetrec gui                                  the floating recorder (same as double-clicking
                                                meetrec.exe, or Start menu → meetrec)
   meetrec record [options]                     record in this terminal; press q to stop, then it uploads
-  meetrec upload FOLDER                        upload (or finish uploading) a recording
+  meetrec upload [--mode M] FOLDER             upload (or finish uploading) a recording; --mode
+                                               work|personal sends it as the other kind
   meetrec sources                              list microphones, and apps playing sound (for --mic / --app)
   meetrec displays                             list screens for --display
   meetrec windows                              list windows for --window
@@ -165,6 +167,8 @@ record options:
   --notes-lang NAME   language of the minutes (default English)
   --people N          number of people, if known (helps speaker labels)
   --context TEXT      names / jargon to help the minutes
+  --mode MODE         work (default) or personal: private to you, with your own context
+                      (an admin has to turn personal mode on for you)
   --shots auto|off    slide / whiteboard screenshots (default auto)
   --window W          where to look for slides: auto (the meeting app's window, found
                       automatically), screen, or part of a window title (meetrec windows)
@@ -208,10 +212,14 @@ func cmdLogin(args []string) error {
 }
 
 func cmdUpload(args []string) error {
-	if len(args) < 1 {
-		return errors.New("usage: meetrec upload FOLDER")
+	fs := flag.NewFlagSet("upload", flag.ExitOnError)
+	mode := fs.String("mode", "", "")
+	fs.Usage = usage
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		return errors.New("usage: meetrec upload [--mode work|personal] FOLDER")
 	}
-	dir := args[0]
+	dir := fs.Arg(0)
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -219,6 +227,15 @@ func cmdUpload(args []string) error {
 	fields, err := readFields(dir)
 	if err != nil {
 		return err
+	}
+	if *mode != "" { // send it as the other kind, and remember that for next time
+		if fields.Mode, err = modeField(*mode); err != nil {
+			return err
+		}
+		b, _ := json.MarshalIndent(fields, "", "  ")
+		if err := os.WriteFile(filepath.Join(dir, "meeting.json"), b, 0o644); err != nil {
+			return err
+		}
 	}
 	return upload(cfg, dir, fields)
 }
@@ -252,6 +269,7 @@ func cmdRecord(args []string) error {
 	notesLang := fs.String("notes-lang", "English", "")
 	people := fs.Int("people", 0, "")
 	context_ := fs.String("context", "", "")
+	mode := fs.String("mode", "work", "")
 	shots := fs.String("shots", "auto", "")
 	display := fs.Int("display", 0, "")
 	window := fs.String("window", "auto", "")
@@ -269,6 +287,10 @@ func cmdRecord(args []string) error {
 	_ = fs.Parse(args)
 	if *display < 0 || *display >= displayCount() {
 		return fmt.Errorf("no display %d (see meetrec displays)", *display)
+	}
+	modeValue, err := modeField(*mode)
+	if err != nil {
+		return err
 	}
 
 	var cfg config
@@ -302,7 +324,8 @@ func cmdRecord(args []string) error {
 	if err != nil {
 		return err
 	}
-	fields := finishFields{Title: *title, Language: *lang, NotesLanguage: *notesLang, Context: *context_, NumSpeakers: *people}
+	fields := finishFields{Title: *title, Language: *lang, NotesLanguage: *notesLang, Context: *context_, NumSpeakers: *people,
+		Mode: modeValue}
 	if fields.Title == "" {
 		fields.Title = "Online meeting " + sess.started.Format("2 Jan 15:04")
 	}

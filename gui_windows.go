@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -108,6 +109,7 @@ const (
 	wmMouseMove, wmLButtonDown, wmLButtonUp   = 0x200, 0x201, 0x202
 	wmRButtonUp, wmSetIcon, wmNull            = 0x205, 0x80, 0x0
 	wmShowOverlay                             = 0x8001 // WM_APP+1: a second launch asks us to show up
+	wmAccess                                  = 0x8002 // WM_APP+2: the server said what this account may do
 
 	swHide, swShowNoActivate, swShowMinNoActive, swShow = 0, 4, 7, 5
 	scRestore, scClose                                  = 0xF120, 0xF060
@@ -117,10 +119,11 @@ const (
 
 	modAlt, modControl, modNorepeat = 0x1, 0x2, 0x4000
 
-	cbAddString, cbSetCurSel, cbGetCurSel = 0x143, 0x14E, 0x147
-	cbsDropdownList, cbnSelChange         = 0x3, 1
-	esAutoHScroll, enChange, bsDefPush    = 0x80, 0x300, 0x1
-	idOK, idCancel                        = 1, 2
+	cbAddString, cbSetCurSel, cbGetCurSel  = 0x143, 0x14E, 0x147
+	cbsDropdownList, cbnSelChange          = 0x3, 1
+	esAutoHScroll, enChange, bsDefPush     = 0x80, 0x300, 0x1
+	bsAutoCheckbox, bmGetCheck, bmSetCheck = 0x3, 0xF0, 0xF1
+	idOK, idCancel                         = 1, 2
 
 	mbOK, mbYesNo, mbIconWarning, mbIconInfo, mbTopmost, mbSetForeground = 0x0, 0x4, 0x30, 0x40, 0x40000, 0x10000
 	idYes                                                                = 6
@@ -240,6 +243,7 @@ const (
 	cmdOpenWeb
 	cmdHide
 	cmdQuit
+	cmdPersonal
 	cmdLangBase    = 100
 	cmdPeopleBase  = 200
 	cmdAllSound    = 300 // "Sound from" menu: all PC sound
@@ -258,8 +262,9 @@ const (
 
 type finishForm struct {
 	hwnd, title, lang, people, countdown uintptr
-	left                                 int  // seconds before uploading with the defaults; -1 = stopped
-	ready                                bool // set up: changes from now on are the person's
+	personal                             uintptr // the "personal" checkbox (0 when not offered)
+	left                                 int     // seconds before uploading with the defaults; -1 = stopped
+	ready                                bool    // set up: changes from now on are the person's
 }
 
 type gui struct {
@@ -274,6 +279,9 @@ type gui struct {
 	hotkeys  bool
 	hidden   bool
 	icons    map[uintptr]uintptr // colour -> taskbar icon
+
+	personalOK atomic.Bool // the server allows personal mode for this account
+	accessSeen atomic.Bool // ... and has said so (unknown while offline)
 
 	sess         *session
 	meetingTitle string // a title guessed from the meeting window
@@ -395,6 +403,8 @@ func runGUI() {
 	g.createWindows()
 	if !g.loggedIn {
 		g.note = "not signed in: recordings are kept but can't be sent yet"
+	} else {
+		go g.checkAccess(g.cfg)
 	}
 	g.loadAppIcon(g.cfg.GUI.AppPath)
 
@@ -415,6 +425,32 @@ func runGUI() {
 }
 
 func (g *gui) px(v float64) int32 { return int32(v*g.scale + 0.5) }
+
+// checkAccess asks the server (off the UI thread) whether this account may use personal
+// mode, then tells the window.
+func (g *gui) checkAccess(cfg config) {
+	me, err := newClient(cfg).me()
+	if err != nil {
+		log.Printf("checking the account: %v", err)
+		return
+	}
+	g.personalOK.Store(me.PersonalAllowed)
+	g.accessSeen.Store(true)
+	pPostMessageW.Call(g.overlay, wmAccess, 0, 0)
+}
+
+// personal: recordings go to the person's private, personal space (green), not work.
+func (g *gui) personal() bool { return g.cfg.GUI.Mode == "personal" }
+
+// The pill's colours: dark grey for work, dark green for personal.
+func (g *gui) pillColor() uintptr {
+	if g.personal() {
+		return rgb(20, 52, 34)
+	}
+	return rgb(32, 33, 38)
+}
+
+var personalGreen = rgb(74, 222, 128)
 
 func makeFont(pt int, weight int) uintptr {
 	dpi, _, _ := pGetDpiForSystem.Call()
@@ -652,6 +688,14 @@ func overlayProc(hwnd, m, wp, lp uintptr) uintptr {
 	case wmShowOverlay:
 		g.show()
 		return 0
+	case wmAccess:
+		if g.personal() && !g.personalOK.Load() {
+			g.cfg.GUI.Mode = ""
+			g.savePrefs()
+			g.note = "personal mode isn't turned on for you: back to work recordings"
+		}
+		g.redraw()
+		return 0
 	case wmCommand: // menu commands sent by other programs (and tests)
 		g.command(loword(wp))
 		return 0
@@ -709,6 +753,9 @@ func (g *gui) statusText() (string, uintptr) {
 	if !g.loggedIn {
 		return "Record (not signed in)", rgb(140, 140, 140)
 	}
+	if g.personal() {
+		return "Record · Personal", personalGreen
+	}
 	return "Record", rgb(140, 140, 140)
 }
 
@@ -728,7 +775,7 @@ func (g *gui) draw(hdc uintptr) {
 		pFillRect.Call(mem, uintptr(unsafe.Pointer(&r)), br)
 		pDeleteObject.Call(br)
 	}
-	fill(rect32{0, 0, w, h}, rgb(32, 33, 38))
+	fill(rect32{0, 0, w, h}, g.pillColor())
 
 	text, color := g.statusText()
 	// status dot (blinks while recording)
@@ -821,6 +868,9 @@ func (g *gui) tick() {
 				more := ""
 				if left > 0 {
 					more = fmt.Sprintf("\n\n%d more waiting weren't tried.", left)
+				}
+				if strings.Contains(err.Error(), "Personal mode") {
+					more += fmt.Sprintf("\n\nTo send it as a work meeting instead, run in a terminal:\nmeetrec upload --mode work \"%s\"", dir)
 				}
 				messageBox(0, fmt.Sprintf("Couldn't send the recording:\n%v\n\nIt's saved in\n%s\n\nTry again later from the menu: Not uploaded.%s",
 					err, dir, more), mbIconWarning)
@@ -1136,6 +1186,13 @@ func (g *gui) menu() {
 	default:
 		add(menu, mfString, cmdStart, "Start recording\tCtrl+Alt+R")
 	}
+	if g.personalOK.Load() || g.personal() {
+		var flags uintptr = mfString
+		if g.phase == phFinishing {
+			flags = mfGrayed // chosen in the open window now
+		}
+		add(menu, flags|check(g.personal()), cmdPersonal, "Personal (private to you, your own context)")
+	}
 	if sub, label := g.pendingMenu(add); sub != 0 {
 		pAppendMenuW.Call(menu, mfPopup, sub, uintptr(unsafe.Pointer(u16(label))))
 	}
@@ -1209,6 +1266,20 @@ func (g *gui) command(id int) {
 		openURL(g.cfg.Server)
 	case id == cmdHide:
 		g.hide()
+	case id == cmdPersonal:
+		if !g.personal() && g.accessSeen.Load() && !g.personalOK.Load() {
+			messageBox(g.overlay, "Personal mode isn't turned on for your account. Ask an admin of Meeting Notes.", mbIconInfo)
+			break
+		}
+		if g.personal() {
+			g.cfg.GUI.Mode = ""
+		} else {
+			g.cfg.GUI.Mode = "personal"
+		}
+		g.savePrefs()
+		if g.phase == phRecording { // a crash now still leaves the right kind in meeting.json
+			_ = g.sess.writeFields(g.defaultFields())
+		}
 	case id == cmdQuit:
 		g.quit()
 	case id >= cmdLangBase && id < cmdLangBase+len(languages):
@@ -1297,7 +1368,8 @@ func (g *gui) defaultFields() finishFields {
 	if title == "" {
 		title = "Online meeting " + g.sess.started.Format("2 Jan 15:04")
 	}
-	return finishFields{Title: title, Language: g.cfg.GUI.Language, NotesLanguage: "English", NumSpeakers: g.cfg.GUI.People}
+	return finishFields{Title: title, Language: g.cfg.GUI.Language, NotesLanguage: "English", NumSpeakers: g.cfg.GUI.People,
+		Mode: g.cfg.GUI.Mode}
 }
 
 func (g *gui) stop() {
@@ -1389,11 +1461,17 @@ func (g *gui) finish(send bool) {
 		if i, _, _ := pSendMessageW.Call(g.fin.people, cbGetCurSel, 0, 0); int(i) >= 0 {
 			f.NumSpeakers = peopleFromIndex(int(i))
 		}
+		if g.fin.personal != 0 {
+			f.Mode = ""
+			if on, _, _ := pSendMessageW.Call(g.fin.personal, bmGetCheck, 0, 0); on == 1 {
+				f.Mode = "personal"
+			}
+		}
 		h := g.fin.hwnd
 		g.fin = finishForm{}
 		pDestroyWindow.Call(h)
 	}
-	g.cfg.GUI.Language, g.cfg.GUI.People = f.Language, f.NumSpeakers
+	g.cfg.GUI.Language, g.cfg.GUI.People, g.cfg.GUI.Mode = f.Language, f.NumSpeakers, f.Mode
 	g.savePrefs()
 	g.sess.retitle(f.Title)
 	if err := g.sess.writeFields(f); err != nil {
@@ -1442,7 +1520,12 @@ func getText(hwnd uintptr) string {
 const autoSendSeconds = 60
 
 func (g *gui) openFinish(dur float64) {
-	W, H := g.px(420), g.px(292)
+	offerPersonal := g.personalOK.Load() || g.personal()
+	off := 0.0 // the rows under "People" move down for the personal checkbox
+	if offerPersonal {
+		off = 34
+	}
+	W, H := g.px(420), g.px(292+off)
 	var wa rect32
 	pSystemParametersInfoW.Call(0x30, 0, uintptr(unsafe.Pointer(&wa)), 0)
 	x, y := (wa.Left+wa.Right-W)/2, (wa.Top+wa.Bottom-H)/2
@@ -1481,14 +1564,20 @@ func (g *gui) openFinish(dur float64) {
 		}
 	}
 	pSendMessageW.Call(g.fin.people, cbSetCurSel, uintptr(peopleToIndex(g.cfg.GUI.People)), 0)
-	g.fin.countdown = child("STATIC", "", 0, 16, 148, 380, 20, 0)
-	child("STATIC", "Discard keeps the recording in its folder without sending it.", 0, 16, 172, 380, 20, 0)
+	if offerPersonal {
+		g.fin.personal = child("BUTTON", "Personal: private to me, with my own context", wsTabstop|bsAutoCheckbox, 110, 142, 286, 24, 13)
+		if g.personal() {
+			pSendMessageW.Call(g.fin.personal, bmSetCheck, 1, 0)
+		}
+	}
+	g.fin.countdown = child("STATIC", "", 0, 16, 148+off, 380, 20, 0)
+	child("STATIC", "Discard keeps the recording in its folder without sending it.", 0, 16, 172+off, 380, 20, 0)
 	send := "Upload"
 	if !g.loggedIn {
 		send = "Save"
 	}
-	child("BUTTON", send, wsTabstop|bsDefPush, 196, 206, 96, 30, idOK)
-	child("BUTTON", "Discard", wsTabstop, 300, 206, 96, 30, idCancel)
+	child("BUTTON", send, wsTabstop|bsDefPush, 196, 206+off, 96, 30, idOK)
+	child("BUTTON", "Discard", wsTabstop, 300, 206+off, 96, 30, idCancel)
 	g.updateCountdown()
 
 	pShowWindow.Call(hw, swShow)
@@ -1526,7 +1615,7 @@ func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 			g.finish(true)
 		case id == idCancel:
 			g.finish(false)
-		case (id == 10 && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange):
+		case (id == 10 && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange) || id == 13:
 			if g.fin.ready && g.fin.left > 0 { // they're choosing: no automatic upload
 				g.fin.left = -1
 				g.updateCountdown()
