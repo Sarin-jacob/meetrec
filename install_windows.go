@@ -96,19 +96,10 @@ func install() (string, error) {
 	if err := copyFile(self, tmp); err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(target); err == nil {
-		// a running exe can't be overwritten, but it can be renamed out of the way
-		old := filepath.Join(dir, "meetrec.old.exe")
-		_ = os.Remove(old)
-		if err := os.Rename(target, old); err != nil {
-			_ = os.Remove(tmp)
-			return "", fmt.Errorf("couldn't replace %s: %w", target, err)
-		}
-	}
-	if err := os.Rename(tmp, target); err != nil {
+	if err := replaceExe(dir, tmp, version); err != nil {
+		_ = os.Remove(tmp)
 		return "", err
 	}
-	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte(version), 0o644)
 	if err := addToPath(dir); err != nil {
 		return "", err
 	}
@@ -315,6 +306,15 @@ func uninstall() error {
 }
 
 // launchDetached starts meetrec again with args, with no console window, and returns.
+// relaunchGUI starts the installed floating recorder in place of this one, after an
+// update. It waits for this copy to close (MEETREC_RESTART, which also says what it was).
+func relaunchGUI(from string) error {
+	cmd := exec.Command(installedExe(), "gui")
+	cmd.Env = append(os.Environ(), "MEETREC_RESTART="+from)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	return cmd.Start()
+}
+
 func launchDetached(exe string, args ...string) error {
 	cmd := exec.Command(exe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW

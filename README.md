@@ -40,6 +40,8 @@ The windows are dark, like the web app, and the menus too on Windows 10 1903 and
 
 The pill hides itself from screen shares and recordings, so it never shows up in a presentation or in the screenshots.
 
+**Updates:** meetrec checks for a new release a minute after it starts and then every 6 hours. A newer one is downloaded in the background, checked against the checksum published with the release, and installed. meetrec then restarts into it as soon as it isn't recording, saving or sending, and the pill says "Updated to …". Switch **Update automatically** off in the menu to be asked instead; **Check for updates** checks right away. `meetrec update` does the same from a terminal. (Copies from before 0.5 can't update themselves: download the new version once.)
+
 ## Recording in a terminal
 
 ```
@@ -125,7 +127,7 @@ go build -ldflags "-s -w" -o meetrec.exe .
 go test ./...
 ```
 
-The icon, the manifest (modern Windows controls, DPI awareness) and the version details live in `winres/` and are compiled into `rsrc_windows_amd64.syso`, which `go build` picks up. After changing them: `go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64`. Local builds report version `dev` and don't install themselves (set `MEETREC_INSTALL=1` to test that). `MEETREC_INSTANCE=test` runs a separate floating recorder next to the installed one (its own lock and window names), and `MEETREC_CONFIG` / `MEETREC_DIR` point it at a test sign-in and folder.
+The icon, the manifest (modern Windows controls, DPI awareness) and the version details live in `winres/` and are compiled into `rsrc_windows_amd64.syso`, which `go build` picks up. After changing them: `go run github.com/tc-hib/go-winres@v0.3.3 make --arch amd64`. Local builds report version `dev` and don't install themselves (set `MEETREC_INSTALL=1` to test that). `MEETREC_INSTANCE=test` runs a separate floating recorder next to the installed one (its own lock and window names), and `MEETREC_CONFIG` / `MEETREC_DIR` point it at a test sign-in and folder, and `MEETREC_RELEASES_URL` at a test release (a JSON file shaped like GitHub's latest-release answer; with `LOCALAPPDATA` pointing at a scratch folder, the whole update can be tried without touching the real install).
 
 **Releases:** pushing a tag like `v0.2.0` runs `.github/workflows/release.yml`, which tests, builds `meetrec.exe` (with that version inside) and publishes it as a GitHub release. The web app's Settings page links to the latest one. A server that can't reach GitHub can serve its own copy instead: put `meetrec.exe` in `DATA_DIR/downloads/`.
 

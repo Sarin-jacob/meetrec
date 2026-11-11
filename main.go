@@ -40,15 +40,17 @@ type guiPrefs struct {
 	Language string `json:"language,omitempty"` // last spoken language chosen
 	People   int    `json:"people,omitempty"`   // 0 = not sure
 	NoShots  bool   `json:"no_shots,omitempty"`
-	NoMic    bool   `json:"no_mic,omitempty"`    // record without the microphone
-	MicID    string `json:"mic_id,omitempty"`    // a chosen microphone ("" = Windows default)
-	MicName  string `json:"mic_name,omitempty"`  // its name, for the menu when it's unplugged
-	NoSystem bool   `json:"no_system,omitempty"` // no PC sound (an in-person meeting)
-	Mode     string `json:"mode,omitempty"`      // "personal", or "" for work
-	App      string `json:"app,omitempty"`       // only this app's sound, by exe name ("" = all PC sound)
-	AppPath  string `json:"app_path,omitempty"`  // where that app lives, for its icon
-	X        int32  `json:"x,omitempty"`         // overlay position (0,0 = default corner)
-	Y        int32  `json:"y,omitempty"`
+	// updates are installed automatically unless this is set (menu: Update automatically)
+	NoAutoUpdate bool   `json:"no_auto_update,omitempty"`
+	NoMic        bool   `json:"no_mic,omitempty"`    // record without the microphone
+	MicID        string `json:"mic_id,omitempty"`    // a chosen microphone ("" = Windows default)
+	MicName      string `json:"mic_name,omitempty"`  // its name, for the menu when it's unplugged
+	NoSystem     bool   `json:"no_system,omitempty"` // no PC sound (an in-person meeting)
+	Mode         string `json:"mode,omitempty"`      // "personal", or "" for work
+	App          string `json:"app,omitempty"`       // only this app's sound, by exe name ("" = all PC sound)
+	AppPath      string `json:"app_path,omitempty"`  // where that app lives, for its icon
+	X            int32  `json:"x,omitempty"`         // overlay position (0,0 = default corner)
+	Y            int32  `json:"y,omitempty"`
 }
 
 func configPath() string {
@@ -137,6 +139,8 @@ func main() {
 		}
 	case "version", "--version":
 		fmt.Println("meetrec", version)
+	case "update":
+		err = cmdUpdate()
 	default:
 		usage()
 		os.Exit(2)
@@ -159,6 +163,8 @@ func usage() {
   meetrec sources                              list microphones, and apps playing sound (for --mic / --app)
   meetrec displays                             list screens for --display
   meetrec windows                              list windows for --window
+  meetrec update                               install the latest release (the floating recorder
+                                               also does this by itself, when it isn't recording)
   meetrec uninstall                            remove meetrec from PATH and the Start menu
 
 record options:
@@ -186,6 +192,25 @@ record options:
   --no-upload         just record; upload later with meetrec upload
   --dir PATH          where recordings are kept (default ~/MeetRec)
 `)
+}
+
+func cmdUpdate() error {
+	if version == "dev" {
+		return errors.New("this is a development build: it doesn't update itself")
+	}
+	have := installedVersion()
+	fmt.Println("Checking for updates…")
+	rel, done, err := updateInstalled(installDir(), have)
+	if err != nil {
+		return err
+	}
+	if !done {
+		fmt.Printf("meetrec %s is the latest.\n", have)
+		return nil
+	}
+	fmt.Printf("Updated meetrec %s → %s. The floating recorder switches to it as soon as it isn't recording.\n", have, rel.Version)
+	pokeGUI()
+	return nil
 }
 
 func cmdLogin(args []string) error {

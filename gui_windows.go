@@ -110,6 +110,7 @@ const (
 	wmRButtonUp, wmSetIcon, wmNull            = 0x205, 0x80, 0x0
 	wmShowOverlay                             = 0x8001 // WM_APP+1: a second launch asks us to show up
 	wmAccess                                  = 0x8002 // WM_APP+2: the server said what this account may do
+	wmUpdate                                  = 0x8003 // WM_APP+3: an update check finished (wParam: how it was asked)
 
 	swHide, swShowNoActivate, swShowMinNoActive, swShow = 0, 4, 7, 5
 	scRestore, scClose                                  = 0xF120, 0xF060
@@ -246,6 +247,9 @@ const (
 	cmdHide
 	cmdQuit
 	cmdPersonal
+	cmdCheckUpdate
+	cmdUpdateNow
+	cmdAutoUpdate
 	cmdLangBase    = 100
 	cmdPeopleBase  = 200
 	cmdAllSound    = 300 // "Sound from" menu: all PC sound
@@ -287,6 +291,14 @@ type gui struct {
 
 	personalOK atomic.Bool // the server allows personal mode for this account
 	accessSeen atomic.Bool // ... and has said so (unknown while offline)
+
+	upd struct {
+		mu       sync.Mutex
+		checking bool
+		latest   string // newest release seen ("" = not checked yet)
+		ready    string // installed, waiting for a quiet moment to restart into
+		err      error
+	}
 
 	sess         *session
 	meetingTitle string // a title guessed from the meeting window
@@ -381,7 +393,17 @@ func runGUI() {
 	runtime.LockOSThread()
 	// one floating recorder at a time: a second launch just brings the first one back
 	mutexName := u16("Local\\meetrec-gui" + instance)
-	if h, err := windows.CreateMutex(nil, false, mutexName); err == windows.ERROR_ALREADY_EXISTS {
+	h, err := windows.CreateMutex(nil, false, mutexName)
+	updatedFrom := os.Getenv("MEETREC_RESTART")
+	if updatedFrom != "" { // the previous version is closing: wait for it
+		_ = os.Unsetenv("MEETREC_RESTART")
+		for i := 0; err == windows.ERROR_ALREADY_EXISTS && i < 80; i++ {
+			windows.CloseHandle(h)
+			time.Sleep(250 * time.Millisecond)
+			h, err = windows.CreateMutex(nil, false, mutexName)
+		}
+	}
+	if err == windows.ERROR_ALREADY_EXISTS {
 		if hw, _, _ := pFindWindowW.Call(uintptr(unsafe.Pointer(u16("meetrecOverlay"+instance))), 0); hw != 0 {
 			pPostMessageW.Call(hw, wmShowOverlay, 0, 0)
 		}
@@ -414,6 +436,11 @@ func runGUI() {
 	} else {
 		go g.checkAccess(g.cfg)
 	}
+	if updatedFrom != "" {
+		log.Printf("updated from %s", updatedFrom)
+		g.result("Updated to "+version+" ✓", rgb(80, 190, 110), 10*time.Second)
+	}
+	pSetTimer.Call(g.overlay, 3, 60*1000, 0) // first update check a minute after starting
 	g.loadAppIcon(g.cfg.GUI.AppPath)
 
 	var m msg
@@ -653,7 +680,15 @@ func overlayProc(hwnd, m, wp, lp uintptr) uintptr {
 		g.draw(wp)
 		return 0
 	case wmTimer:
+		if wp == 3 { // update check, then every 6 hours
+			pSetTimer.Call(hwnd, 3, 6*3600*1000, 0)
+			g.checkUpdates(updBackground)
+			return 0
+		}
 		g.tick()
+		return 0
+	case wmUpdate:
+		g.updateChecked(int(wp))
 		return 0
 	case wmHotkey:
 		g.hotkey(wp)
@@ -895,6 +930,7 @@ func (g *gui) tick() {
 	if g.phase == phResult && time.Now().After(g.resultUntil) {
 		g.phase = phIdle
 	}
+	g.restartIfQuiet()
 	g.redraw()
 }
 
@@ -1235,6 +1271,7 @@ func (g *gui) menu() {
 	if g.loggedIn {
 		add(menu, mfString, cmdOpenWeb, "Open Meeting Notes")
 	}
+	g.updateMenu(menu, add, check)
 	add(menu, mfString, cmdHide, "Hide to taskbar")
 	add(menu, mfString, cmdQuit, "Quit")
 
@@ -1274,6 +1311,16 @@ func (g *gui) command(id int) {
 		openURL(g.cfg.Server)
 	case id == cmdHide:
 		g.hide()
+	case id == cmdCheckUpdate:
+		g.checkUpdates(updAsked)
+	case id == cmdUpdateNow:
+		g.checkUpdates(updInstall)
+	case id == cmdAutoUpdate:
+		g.cfg.GUI.NoAutoUpdate = !g.cfg.GUI.NoAutoUpdate
+		g.savePrefs()
+		if !g.cfg.GUI.NoAutoUpdate {
+			g.checkUpdates(updBackground)
+		}
 	case id == cmdPersonal:
 		if !g.personal() && g.accessSeen.Load() && !g.personalOK.Load() {
 			messageBox(g.overlay, "Personal mode isn't turned on for your account. Ask an admin of Meeting Notes.", mbIconInfo)
