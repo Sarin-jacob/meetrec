@@ -5,7 +5,7 @@ package main
 // The floating recorder: a small always-on-top pill. Click it for a menu (start, stop,
 // pause, screenshot, language, people, hide). "Hide to taskbar" swaps it for a taskbar
 // button; recording carries on. Ctrl+Alt shortcuts work while the pill is showing.
-// After stopping, a small window asks for the title, language and people, and uploads
+// After stopping, a small window asks for the title, language, people and context, and uploads
 // (or uploads with those defaults by itself after a minute).
 //
 // Plain Win32 through syscalls: no extra runtime, a few MB of RAM.
@@ -75,6 +75,11 @@ var (
 	pDrawTextW                     = user32.NewProc("DrawTextW")
 	pFindWindowW                   = user32.NewProc("FindWindowW")
 	pSetFocus                      = user32.NewProc("SetFocus")
+	pGetForegroundWindow           = user32.NewProc("GetForegroundWindow")
+	pGetWindowThreadProcessId      = user32.NewProc("GetWindowThreadProcessId")
+	pAttachThreadInput             = user32.NewProc("AttachThreadInput")
+	pBringWindowToTop              = user32.NewProc("BringWindowToTop")
+	pFlashWindowEx                 = user32.NewProc("FlashWindowEx")
 	pGetSysColorBrush              = user32.NewProc("GetSysColorBrush")
 	pGetDpiForSystem               = user32.NewProc("GetDpiForSystem")
 	pSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
@@ -123,10 +128,12 @@ const (
 	cbAddString, cbSetCurSel, cbGetCurSel  = 0x143, 0x14E, 0x147
 	cbsDropdownList, cbnSelChange          = 0x3, 1
 	esAutoHScroll, enChange, bsDefPush     = 0x80, 0x300, 0x1
+	esMultiline, esAutoVScroll, esWantRet  = 0x4, 0x40, 0x1000
 	bsAutoCheckbox, bmGetCheck, bmSetCheck = 0x3, 0xF0, 0xF1
 	idOK, idCancel                         = 1, 2
 	// the finish window's other controls
 	idPersonalBox, idBadge, idCountdown, idNote, idPersonalLabel = 13, 14, 15, 16, 17
+	idContext                                                    = 18
 
 	mbOK, mbYesNo, mbIconWarning, mbIconInfo, mbTopmost, mbSetForeground = 0x0, 0x4, 0x30, 0x40, 0x40000, 0x10000
 	idYes                                                                = 6
@@ -268,12 +275,14 @@ const (
 
 type finishForm struct {
 	hwnd, title, lang, people, countdown uintptr
+	context                              uintptr // names, jargon, what it's about
 	personal                             uintptr // the "personal" checkbox (0 when not offered)
 	ok, badge                            uintptr // the Upload button; the "PERSONAL" badge
 	personalOn                           bool    // the checkbox is ticked
 	light                                bool    // high contrast: system colours, no dark theme
 	left                                 int     // seconds before uploading with the defaults; -1 = stopped
 	ready                                bool    // set up: changes from now on are the person's
+	raised                               bool    // brought to the front once more after opening
 }
 
 type gui struct {
@@ -1516,6 +1525,7 @@ func (g *gui) finish(send bool) {
 		if i, _, _ := pSendMessageW.Call(g.fin.people, cbGetCurSel, 0, 0); int(i) >= 0 {
 			f.NumSpeakers = peopleFromIndex(int(i))
 		}
+		f.Context = strings.TrimSpace(getText(g.fin.context))
 		if g.fin.personal != 0 {
 			f.Mode = ""
 			if on, _, _ := pSendMessageW.Call(g.fin.personal, bmGetCheck, 0, 0); on == 1 {
@@ -1580,7 +1590,8 @@ func (g *gui) openFinish(dur float64) {
 	if offerPersonal {
 		off = 34
 	}
-	W, H := g.px(420), g.px(292+off)
+	const ctx = 70.0 // the context box and its hint
+	W, H := g.px(420), g.px(292+off+ctx)
 	var wa rect32
 	pSystemParametersInfoW.Call(0x30, 0, uintptr(unsafe.Pointer(&wa)), 0)
 	x, y := (wa.Left+wa.Right-W)/2, (wa.Top+wa.Bottom-H)/2
@@ -1636,6 +1647,10 @@ func (g *gui) openFinish(dur float64) {
 			pSendMessageW.Call(g.fin.personal, bmSetCheck, 1, 0)
 		}
 	}
+	child("STATIC", "Context", 0, 16, 146+off, 90, 20, 0)
+	g.fin.context = child("EDIT", "", wsBorder|wsTabstop|wsVscroll|esMultiline|esAutoVScroll|esWantRet, 110, 143+off, 286, 46, idContext)
+	child("STATIC", "Optional: names, jargon, what it's about", 0, 110, 192+off, 286, 18, idNote)
+	off += ctx
 	g.fin.countdown = child("STATIC", "", 0, 16, 148+off, 380, 20, idCountdown)
 	child("STATIC", "Discard keeps the recording in its folder without sending it.", 0, 16, 172+off, 380, 20, idNote)
 	send := "Upload"
@@ -1652,11 +1667,44 @@ func (g *gui) openFinish(dur float64) {
 	g.showPersonal()
 
 	pShowWindow.Call(hw, swShow)
-	pSetForegroundWindow.Call(hw)
+	bringToFront(hw)
 	pSetFocus.Call(g.fin.title)
 	pSendMessageW.Call(g.fin.title, 0xB1, 0, ^uintptr(0)) // EM_SETSEL: select all, typing replaces it
 	pSetTimer.Call(hw, 2, 1000, 0)
 	g.fin.ready = true
+}
+
+// bringToFront puts a window on top and gives it the keyboard. Windows only lets the program
+// the person is using take the focus, and the floating recorder never takes it (it doesn't
+// activate when clicked), so a plain SetForegroundWindow fails after Stop and the window
+// opens behind the meeting. Sharing the foreground program's input state for a moment lets it
+// through; if Windows still says no, the taskbar button flashes until it's clicked.
+func bringToFront(hw uintptr) {
+	pSetWindowPos.Call(hw, ^uintptr(0), 0, 0, 0, 0, 0x1|0x2|0x40) // HWND_TOPMOST, no move/size, show
+	fg, _, _ := pGetForegroundWindow.Call()
+	if fg == hw {
+		return
+	}
+	me := windows.GetCurrentThreadId()
+	if other, _, _ := pGetWindowThreadProcessId.Call(fg, 0); fg != 0 && other != 0 && uint32(other) != me {
+		pAttachThreadInput.Call(uintptr(me), other, 1)
+		defer pAttachThreadInput.Call(uintptr(me), other, 0)
+	}
+	pBringWindowToTop.Call(hw)
+	pSetForegroundWindow.Call(hw)
+	if now, _, _ := pGetForegroundWindow.Call(); now != hw {
+		fl := flashwinfo{hwnd: hw, flags: 0x3 | 0xC, count: 0} // FLASHW_ALL | FLASHW_TIMERNOFG
+		fl.size = uint32(unsafe.Sizeof(fl))
+		pFlashWindowEx.Call(uintptr(unsafe.Pointer(&fl)))
+	}
+}
+
+type flashwinfo struct {
+	size    uint32
+	hwnd    uintptr
+	flags   uint32
+	count   uint32
+	timeout uint32
 }
 
 // showPersonal: the badge, window title and button colour follow the "personal" checkbox.
@@ -1693,6 +1741,17 @@ func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 		g.drawButton(*(**drawitem)(unsafe.Pointer(&lp))) // lp points at a DRAWITEMSTRUCT owned by Windows
 		return 1
 	case wmTimer:
+		if g.fin.hwnd == hwnd {
+			if fg, _, _ := pGetForegroundWindow.Call(); fg != hwnd {
+				if !g.fin.raised { // once: the meeting app may have come forward as the call ended
+					bringToFront(hwnd)
+					pSetFocus.Call(g.fin.title)
+				} else { // after that stay above other always-on-top windows, without taking the keyboard
+					pSetWindowPos.Call(hwnd, ^uintptr(0), 0, 0, 0, 0, 0x1|0x2|0x10)
+				}
+			}
+			g.fin.raised = true
+		}
 		if g.fin.hwnd == hwnd && g.fin.left > 0 {
 			g.fin.left--
 			g.updateCountdown()
@@ -1718,7 +1777,7 @@ func finishProc(hwnd, m, wp, lp uintptr) uintptr {
 			g.fin.personalOn = on == 1
 			g.showPersonal()
 			g.stopCountdown()
-		case (id == 10 && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange):
+		case ((id == 10 || id == idContext) && code == enChange) || ((id == 11 || id == 12) && code == cbnSelChange):
 			g.stopCountdown()
 		}
 		return 0

@@ -30,7 +30,7 @@ Start **meetrec** from the Start menu (or double-click `meetrec.exe`). A small p
 
 **Hide to taskbar** swaps the pill for a taskbar button that shows the time; recording carries on, and the shortcuts are off so they can't be pressed by accident. Click the taskbar button to bring the pill back.
 
-**When you stop**, a small window asks for the meeting title (taken from Teams/Webex window titles when it can), the language and the number of people. **Upload** sends it; **Discard** keeps the recording in its folder without sending it. If you don't touch it, it uploads with those defaults after a minute. The pill then shows the upload progress and "Sent ✓".
+**When you stop**, a small window comes to the front and asks for the meeting title (taken from Teams/Webex window titles when it can), the language, the number of people and, optionally, **context**: names, jargon or what it's about, which helps the minutes. **Upload** sends it; **Discard** keeps the recording in its folder without sending it. If you don't touch it, it uploads with those defaults after a minute. The pill then shows the upload progress and "Sent ✓".
 
 **Personal mode:** when an admin of Meeting Notes has turned personal mode on for you, the menu has **Personal (private to you, your own context)** and the window after stopping has a **Personal** checkbox. Personal recordings go to your private space in Meeting Notes: only you see them, and their minutes use your personal context instead of the team's. While it's on, the pill turns green and says *Record · Personal*, and the Upload button is green. The choice is remembered. If the server refuses a personal recording (personal mode was turned off), it's kept under **Not uploaded**; send it as a work meeting with `meetrec upload --mode work FOLDER`.
 
@@ -54,7 +54,7 @@ Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screen
 |---|---|
 | `--lang` | spoken language: `hi`, `ml`, `ta`, `te`, `bn`, `mr`, `gu`, `kn`, `pa`… |
 | `--people N` | number of people, if you know it (better speaker labels) |
-| `--context "..."` | names and jargon, to help the minutes |
+| `--context "..."` | names and jargon, to help the minutes (the window after stopping has a **Context** box for the same) |
 | `--mode personal` | a personal recording: private to you, with your own context (an admin has to turn personal mode on for you) |
 | `--shots off` | no screenshots |
 | `--window W` | where to look for slides: `auto` (the meeting app's window, found automatically; the default), `screen`, or part of a window title (`meetrec windows` lists them) |
