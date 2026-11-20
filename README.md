@@ -66,7 +66,7 @@ Keys: q = stop   p = pause/resume   s = screenshot now   x = pause/resume screen
 | `--max 2h` | stop automatically |
 | `--no-upload` | keep it local; send later with `meetrec upload FOLDER` |
 
-**Where recordings go:** `~/MeetRec/<date time title>/` (or the folder in the `MEETREC_DIR` environment variable) holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped; `--mode work` or `--mode personal` sends it as the other kind.
+**Where recordings go:** `~/MeetRec/<date time title>/` (or the folder in the `MEETREC_DIR` environment variable) holds `audio.wav` (16 kHz stereo: left = your mic, right = the PC; about 230 MB per hour), `shots/` and `meeting.json`. The audio file stays playable even if the PC crashes mid-meeting. **It's sent compressed:** just before uploading, meetrec turns it into AAC in an `.m4a` (about 43 MB per hour, a fifth of the WAV) with Windows' own encoder; the pill says *Packing* while it does. Both channels stay apart. The `.m4a` is deleted once it's sent, and the WAV stays as the master copy. If Windows can't encode it (an N edition without the Media Feature Pack), the WAV is sent as before. If the upload fails (no internet, server down), the recording stays there. `meetrec upload FOLDER` resumes where it stopped; `--mode work` or `--mode personal` sends it as the other kind.
 
 **You are labelled automatically.** Because your mic is on its own channel, the server knows which speech is yours and names that speaker with the name set in the web app (Settings → Your name). It also keeps learning your voice from these recordings, which helps phone recordings too.
 
@@ -137,11 +137,12 @@ The icon, the manifest (modern Windows controls, DPI awareness) and the version 
 |---|---|
 | `capture_windows.go` | WASAPI capture: microphone + loopback, follows the default device |
 | `sources_windows.go` | microphones, apps playing sound, capturing a single app |
-| `audio.go` | resampling to 16 kHz, keeping the two sources in sync, crash-safe WAV |
+| `audio.go` | resampling to 16 kHz, keeping the two sources in sync, crash-safe WAV, 16 → 48 kHz for the encoder |
 | `shots.go` | when to take a screenshot (last settled frame), preview + full quality |
 | `vision.go` | finding the shared content: layout, faces (pigo), motion, photo-like areas |
 | `window_windows.go` | capturing the meeting window |
 | `upload.go` | resumable upload of audio and screenshots |
+| `compress_windows.go` | WAV → AAC `.m4a` with Media Foundation before uploading |
 | `main.go` | commands, terminal keys, status line |
 | `session.go` | one recording: capture threads, mixer, WAV file, screenshots |
 | `gui_windows.go` | the floating recorder, taskbar button, shortcuts, the window after stopping |

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -89,6 +90,7 @@ type uploadState struct {
 	ID        string          `json:"id"`
 	Shots     map[string]bool `json:"shots"`
 	MeetingID string          `json:"meeting_id"`
+	File      string          `json:"file,omitempty"` // what's being sent: audio.m4a, or audio.wav (older copies: empty)
 }
 
 type finishFields struct {
@@ -130,12 +132,37 @@ func (c *client) uploadRecording(dir string, fields finishFields, say func(strin
 		return st.MeetingID, nil // already done
 	}
 
-	audio := filepath.Join(dir, "audio.wav")
-	info, err := os.Stat(audio)
-	if err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "audio.wav")); err != nil {
 		return "", fmt.Errorf("no audio.wav in %s", dir)
 	}
+	// send the compressed copy (a sixth of the size); an upload already under way keeps its file
+	if st.File == "" {
+		st.File = "audio.wav"
+		if st.ID == "" {
+			say("compressing audio…")
+			shown := -1
+			if m4a, err := compressAudio(dir, func(p float64) {
+				if pc := int(p * 100); pc/5 != shown/5 { // every 5 %
+					shown = pc
+					say(fmt.Sprintf("compressing audio… %d%%", pc))
+				}
+			}); err == nil {
+				st.File = filepath.Base(m4a)
+			} else {
+				log.Printf("sending the WAV: couldn't compress it (%v)", err)
+			}
+		}
+	}
+	audio := filepath.Join(dir, st.File)
+	info, err := os.Stat(audio)
+	if err != nil {
+		return "", fmt.Errorf("no %s in %s", st.File, dir)
+	}
 	size := info.Size()
+	ctype := "audio/wav"
+	if filepath.Ext(st.File) == ".m4a" {
+		ctype = "audio/mp4"
+	}
 
 	// 1. start (or resume) the upload
 	received := int64(0)
@@ -151,7 +178,7 @@ func (c *client) uploadRecording(dir string, fields finishFields, say func(strin
 		}
 	}
 	if st.ID == "" {
-		body, _ := json.Marshal(map[string]any{"filename": "audio.wav", "size": size, "content_type": "audio/wav"})
+		body, _ := json.Marshal(map[string]any{"filename": st.File, "size": size, "content_type": ctype})
 		var r struct {
 			ID string `json:"id"`
 		}
@@ -247,5 +274,9 @@ func (c *client) uploadRecording(dir string, fields finishFields, say func(strin
 	}
 	st.MeetingID = m.ID
 	save()
+	if st.File == "audio.m4a" { // sent: the WAV stays as the recording's master copy
+		_ = f.Close() // Windows won't delete an open file
+		_ = os.Remove(filepath.Join(dir, "audio.m4a"))
+	}
 	return m.ID, nil
 }

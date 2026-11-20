@@ -1177,7 +1177,11 @@ func (g *gui) upload(dirs []string) {
 			}
 			id, err = newClient(cfg).uploadRecording(dir, fields, func(s string) {
 				t := "Sending…"
-				if m := percent.FindStringSubmatch(s); m != nil {
+				if m := percent.FindStringSubmatch(s); m != nil && strings.HasPrefix(s, "compressing") {
+					t = "Packing " + m[1] + "%"
+				} else if strings.HasPrefix(s, "compressing") {
+					t = "Packing…"
+				} else if m != nil {
 					t = "Sending " + m[1] + "%"
 				} else if m := shotCount.FindStringSubmatch(s); m != nil {
 					t = "Shots " + m[1]

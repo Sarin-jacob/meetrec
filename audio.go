@@ -281,3 +281,82 @@ func (w *wavWriter) close() error {
 	}
 	return w.f.Close()
 }
+
+// ---------------------------------------------------------------- upsampler
+
+// upsampler raises the sample rate by a whole factor (16 → 48 kHz for the AAC encoder):
+// zeros between the samples, then a windowed-sinc low-pass below the old Nyquist frequency,
+// done as one short filter per output phase. It keeps its history between calls.
+type upsampler struct {
+	factor int
+	phases [][]float32 // phases[p][k]: weight of the input k samples back, for output phase p
+	hist   []float32
+}
+
+const upsampleTaps = 16 // per phase
+
+func newUpsampler(factor int) *upsampler {
+	u := &upsampler{factor: factor}
+	if factor <= 1 {
+		u.factor = 1
+		return u
+	}
+	n := upsampleTaps * factor
+	h := make([]float64, n)
+	cutoff := 0.45 / float64(factor) // of the output rate: just under the input's Nyquist
+	center := float64(n-1) / 2
+	for i := range h {
+		x := float64(i) - center
+		s := 2 * cutoff
+		if x != 0 {
+			s = math.Sin(2*math.Pi*cutoff*x) / (math.Pi * x)
+		}
+		h[i] = s * (0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(n-1))) // Hann
+	}
+	u.phases = make([][]float32, factor)
+	for p := range u.phases {
+		var sum float64
+		for k := 0; k < upsampleTaps; k++ {
+			sum += h[k*factor+p]
+		}
+		u.phases[p] = make([]float32, upsampleTaps)
+		for k := range u.phases[p] {
+			u.phases[p][k] = float32(h[k*factor+p] / sum) // each phase passes DC unchanged
+		}
+	}
+	u.hist = make([]float32, upsampleTaps-1)
+	return u
+}
+
+// process takes samples on the int16 scale and returns factor times as many.
+func (u *upsampler) process(in []float32) []int16 {
+	out := make([]int16, 0, len(in)*u.factor)
+	if u.factor == 1 {
+		for _, v := range in {
+			out = append(out, clamp16(v))
+		}
+		return out
+	}
+	buf := append(append(make([]float32, 0, len(u.hist)+len(in)), u.hist...), in...)
+	for n := upsampleTaps - 1; n < len(buf); n++ {
+		for _, ph := range u.phases {
+			var acc float32
+			for k, w := range ph {
+				acc += buf[n-k] * w
+			}
+			out = append(out, clamp16(acc))
+		}
+	}
+	u.hist = append(u.hist[:0], buf[len(buf)-(upsampleTaps-1):]...)
+	return out
+}
+
+func clamp16(v float32) int16 {
+	switch {
+	case v > 32767:
+		return 32767
+	case v < -32768:
+		return -32768
+	}
+	return int16(math.Round(float64(v)))
+}
